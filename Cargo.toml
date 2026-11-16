@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/osprey-pro",
+    "crates/osprey-keygen",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-OspreyDB-Commercial"
+repository = "https://github.com/ospreydb/osprey-pro"
+
+[workspace.dependencies]
+osprey-core = { path = "/home/ramos/repositories/osprey/crates/osprey-core", version = "0.1.0" }
+osprey-simd = { path = "/home/ramos/repositories/osprey/crates/osprey-simd", version = "0.1.0" }
+osprey-storage = { path = "/home/ramos/repositories/osprey/crates/osprey-storage", version = "0.1.0" }
+
+arrow = "53"
+arrow-flight = "53.4"
+axum = "0.8"
+base64 = "0.22"
+bytemuck = { version = "1.19", features = ["derive"] }
+bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = "2.1"
+futures = "0.3"
+half = { version = "2.4", features = ["bytemuck", "std"] }
+object_store = { version = "0.11", features = ["aws", "gcp", "azure", "http"] }
+prost = "0.13"
+rand = "0.8"
+rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+roaring = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+tracing = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+ptr_as_ptr = "warn"
