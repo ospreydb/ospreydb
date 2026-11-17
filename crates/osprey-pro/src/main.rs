@@ -1,6 +1,7 @@
 //! `osprey-pro` production daemon hosting Apache Arrow Flight (`:8815`),
-//! Drop-In Qdrant/Cohere HTTP & Prometheus `/metrics` (`:6333`), offline
-//! Ed25519 license verification, WAL/LSM Delta Buffer, and CoW Compactor.
+//! Drop-In Qdrant/Cohere HTTP & Prometheus `/metrics` (`:6333`), built-in
+//! `/v1/embeddings` (OpenAI-compatible), offline Ed25519 license verification,
+//! WAL/LSM Delta Buffer, and CoW Compactor.
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -16,11 +17,11 @@ use object_store::ObjectStore;
 use osprey_core::math::padded_dimension;
 use osprey_core::{ProCapability, RawVectorRecord};
 use osprey_pro::{
-    serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, HttpServerState,
-    HybridSearchEngine, LsmDeltaBuffer, LutRankReranker, ManifestStore, OfflineLicenseVerifier,
-    OspreyFlightService, OspreyWal, ProEngineError, ProMetricsRegistry, ProResult, WalConfig,
-    WalRecoveryMode, WalSyncPolicy, DEFAULT_ARROW_FLIGHT_ADDR, DEFAULT_HTTP_ADDR,
-    DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
+    serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder, EmbedderConfig,
+    HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker, ManifestStore,
+    OfflineLicenseVerifier, OspreyFlightService, OspreyWal, ProEngineError, ProMetricsRegistry,
+    ProResult, WalConfig, WalRecoveryMode, WalSyncPolicy, DEFAULT_ARROW_FLIGHT_ADDR,
+    DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
 };
 use osprey_storage::{
     build_object_store, MinipageLruCache, RemoteStoreConfig, WarpConfig,
@@ -31,7 +32,7 @@ use tokio::sync::Notify;
 #[derive(Debug, Parser)]
 #[command(
     name = "osprey-pro",
-    about = "OspreyDB Commercial Engine (Arrow Flight, Qdrant/Cohere Drop-In, WAL/LSM & S3 CAS)",
+    about = "OspreyDB Commercial Engine (Arrow Flight, Qdrant/Cohere Drop-In, Auto-Embeddings, WAL/LSM & S3 CAS)",
     version
 )]
 struct Cli {
@@ -44,83 +45,98 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start the production Arrow Flight + Drop-In HTTP/Prometheus server.
-    Serve(ServeArgs),
-    /// Internal WAL intense-write workload driver used for SIGKILL crash-recovery verification.
+    Serve(Box<ServeArgs>),
     WalStress(WalStressArgs),
 }
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    /// Offline Ed25519 commercial license key (`OSPREY-PRO-v1.<payload>.<sig>`).
     #[arg(long, env = "OSPREY_PRO_LICENSE")]
     license: Option<String>,
 
-    /// Default collection name for Qdrant-compatible `/collections/{name}/points/search`.
     #[arg(long, default_value = "default")]
     collection: String,
 
-    /// Original dense vector dimensionality.
     #[arg(long, default_value_t = 128)]
     dim: usize,
 
-    /// Deterministic FWHT seed.
     #[arg(long, default_value_t = 0x4F53_5052_0001)]
     fwht_seed: u64,
 
-    /// Path to the crash-safe Write-Ahead Log file.
     #[arg(long, default_value = "./osprey-pro.wal")]
     wal_path: PathBuf,
 
-    /// Optional object storage URI (`s3://bucket/prefix`, `file:///path`, or in-memory if omitted).
     #[arg(long)]
     object_store_uri: Option<String>,
 
-    /// Apache Arrow Flight gRPC bind address.
     #[arg(long, default_value = DEFAULT_ARROW_FLIGHT_ADDR)]
     flight_addr: SocketAddr,
 
-    /// Drop-In Qdrant/Cohere HTTP & Prometheus `/metrics` bind address.
     #[arg(long, default_value = DEFAULT_HTTP_ADDR)]
     http_addr: SocketAddr,
 
-    /// Delta buffer vector threshold before triggering CoW slab compaction.
     #[arg(long, default_value_t = osprey_pro::DEFAULT_DELTA_FLUSH_THRESHOLD)]
     delta_flush_threshold: usize,
+
+    // -- Embedder configuration (OpenAI-compatible /v1/embeddings) --
+    #[arg(long, env = "OSPREY_EMBED_URL")]
+    embed_url: Option<String>,
+
+    #[arg(long, env = "OSPREY_EMBED_MODEL", default_value = "text-embedding-3-small")]
+    embed_model: String,
+
+    #[arg(long, env = "OSPREY_EMBED_API_KEY")]
+    embed_api_key: Option<String>,
+
+    #[arg(long, default_value_t = 32)]
+    embed_batch_size: usize,
 }
 
 #[derive(Debug, Args)]
 struct WalStressArgs {
-    /// WAL file path to hammer with concurrent `fsync` batches.
     #[arg(long)]
     wal_path: PathBuf,
 
-    /// Vector dimensionality.
     #[arg(long, default_value_t = 64)]
     dim: usize,
 
-    /// Number of batches to write (`0` = loop until killed).
     #[arg(long, default_value_t = 0)]
     batches: usize,
 
-    /// Records per WAL batch.
     #[arg(long, default_value_t = 50)]
     batch_size: usize,
 }
 
 async fn run_serve(args: ServeArgs) -> ProResult<()> {
-    if let Some(token) = &args.license {
-        let verifier = OfflineLicenseVerifier::new()?;
+    let embedder_config = EmbedderConfig {
+        embed_url: args.embed_url.unwrap_or_default(),
+        embed_model: args.embed_model,
+        api_key: args.embed_api_key,
+        batch_size: args.embed_batch_size,
+    };
+    let embedder = Arc::new(Embedder::new(embedder_config));
+
+    let verifier = OfflineLicenseVerifier::new()?;
+    let active_license = if let Some(token) = &args.license {
         let lic = verifier.verify_now(token)?;
         let _ = verifier.verify_and_activate(token, lic.issued_at)?;
         tracing::info!(
             org = %lic.customer_org,
             tier = %lic.tier,
             max_nodes = lic.max_nodes,
+            max_vectors = lic.max_vectors,
+            unlimited_vectors = lic.is_unlimited_vectors(),
             arrow_flight = lic.has_capability(ProCapability::ArrowFlight),
             "verified offline Ed25519 commercial license"
         );
-    }
+        Some(lic)
+    } else {
+        tracing::info!(
+            max_vectors = osprey_pro::COMMUNITY_MAX_VECTORS,
+            "Single-Node Community Tier — no license key supplied (5M vector limit, local storage)"
+        );
+        None
+    };
 
     let padded_dim = padded_dimension(args.dim)?;
     let (wal, replayed) = OspreyWal::open(&args.wal_path, WalConfig::default())?;
@@ -179,7 +195,10 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
     let compactor_handle = compactor.spawn_background(Arc::clone(&delta), Some(wal));
 
     let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED)?);
-    let http_state = HttpServerState::new(Arc::clone(&reranker), metrics);
+    let http_state = HttpServerState::new(Arc::clone(&reranker), embedder, Arc::clone(&metrics));
+    if let Some(lic) = active_license {
+        http_state.activate_license(lic);
+    }
     http_state.register_collection(&args.collection, Arc::clone(&engine))?;
 
     let flight_service = OspreyFlightService::new(engine, reranker);
@@ -281,7 +300,7 @@ fn run_wal_stress(args: WalStressArgs) -> ProResult<()> {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let res = match cli.command {
-        Some(Command::Serve(args)) => run_serve(args).await,
+        Some(Command::Serve(args)) => run_serve(*args).await,
         Some(Command::WalStress(args)) => run_wal_stress(args),
         None => run_serve(cli.serve).await,
     };

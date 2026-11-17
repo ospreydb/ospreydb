@@ -36,17 +36,23 @@ const STACK_SIG_BUF_BYTES: usize = 96;
 /// Statically embedded 32-byte Ed25519 public verifying key (`zero phone-home`).
 pub const EMBEDDED_PUBLIC_KEY: &[u8; 32] = include_bytes!("osprey_pro_ed25519.pub");
 
+/// Community tier hard limit: 5,000,000 vectors without a Pro license key.
+pub const COMMUNITY_MAX_VECTORS: u64 = 5_000_000;
+
 /// Commercial license claims decoded from an `OSPREY-PRO-v1.<payload>.<sig>` token.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OspreyLicense {
     /// Licensed customer organization identifier.
     #[serde(alias = "org_name")]
     pub customer_org: String,
-    /// Commercial plan tier (e.g., `"enterprise"`, `"pro"`, `"team"`, `"oem"`).
+    /// Commercial plan tier (`"personal"`, `"founding"`, `"enterprise"`, `"beta"`).
     #[serde(alias = "plan_tier")]
     pub tier: String,
     /// Maximum concurrent cluster nodes authorized (`0` means unlimited).
     pub max_nodes: u32,
+    /// Maximum vector count (`0` means unlimited, i.e. no hard cap).
+    #[serde(default)]
+    pub max_vectors: u64,
     /// Issuance timestamp in Unix seconds (UTC).
     pub issued_at: u64,
     /// Expiration timestamp in Unix seconds (UTC).
@@ -90,6 +96,18 @@ impl OspreyLicense {
     #[must_use]
     pub const fn allows_nodes(&self, active_nodes: u32) -> bool {
         self.max_nodes == 0 || active_nodes <= self.max_nodes
+    }
+
+    /// Returns `true` if `vector_count` does not exceed [`Self::max_vectors`] (`0` = unlimited).
+    #[must_use]
+    pub const fn allows_vectors(&self, vector_count: u64) -> bool {
+        self.max_vectors == 0 || vector_count <= self.max_vectors
+    }
+
+    /// Returns `true` if this is a `founding` or `enterprise` license that unlocks unlimited vectors.
+    #[must_use]
+    pub fn is_unlimited_vectors(&self) -> bool {
+        self.max_vectors == 0
     }
 
     /// Converts this license payload into the open-core [`LicenseClaims`] projection.
@@ -403,6 +421,7 @@ mod tests {
             customer_org: "acme-corp-datalake".to_owned(),
             tier: "enterprise".to_owned(),
             max_nodes: 16,
+            max_vectors: 0,
             issued_at,
             expires_at,
             features: vec![

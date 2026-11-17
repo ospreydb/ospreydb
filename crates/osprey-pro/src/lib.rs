@@ -11,6 +11,7 @@
 
 pub mod compactor;
 pub mod delta_buffer;
+pub mod embedder;
 pub mod error;
 pub mod flight_server;
 pub mod http_server;
@@ -26,6 +27,7 @@ pub use compactor::{
     DEFAULT_TOMBSTONE_GC_THRESHOLD,
 };
 pub use delta_buffer::{FrozenDeltaSnapshot, HybridSearchEngine, LoadedSegment, LsmDeltaBuffer};
+pub use embedder::{Embedder, EmbedderConfig};
 pub use error::{ProEngineError, ProLicenseError, ProResult};
 pub use flight_server::{serve_arrow_flight, OspreyFlightService, DEFAULT_ARROW_FLIGHT_ADDR};
 pub use http_server::{
@@ -35,8 +37,8 @@ pub use http_server::{
 };
 pub use license::{
     capability_from_str, capability_name, Ed25519LicenseVerifier, OfflineLicenseVerifier,
-    OspreyLicense, EMBEDDED_PUBLIC_KEY, LICENSE_TOKEN_PREFIX, MAX_CLOCK_SKEW_SECS,
-    MAX_LICENSE_TOKEN_BYTES,
+    OspreyLicense, COMMUNITY_MAX_VECTORS, EMBEDDED_PUBLIC_KEY, LICENSE_TOKEN_PREFIX,
+    MAX_CLOCK_SKEW_SECS, MAX_LICENSE_TOKEN_BYTES,
 };
 pub use manifest::{
     ClusterManifest, ManifestSnapshot, ManifestStore, SegmentDescriptor, DEFAULT_MANIFEST_KEY,

@@ -1846,6 +1846,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "clap",
+ "crc32fast",
  "ed25519-dalek",
  "futures",
  "half",

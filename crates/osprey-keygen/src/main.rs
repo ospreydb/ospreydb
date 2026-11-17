@@ -1,5 +1,9 @@
 //! Private developer CLI (`osprey-keygen`) for generating Ed25519 keypairs and
-//! issuing `OSPREY-PRO-v1.<base64url_payload>.<base64url_sig>` offline licenses.
+//! issuing `OSPREY-PRO-v1.<base64url_payload>.<base64url_sig>` offline licenses
+//! for all three commercial waves:
+//!   - `--tier beta --days 90`  (free Design Partners)
+//!   - `--tier founding --days 365`  (discounted Early Access)
+//!   - `--tier enterprise --days 365`  (unlimited scale, multi-node S3, Arrow Flight)
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,11 +14,43 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::{Signer as _, SigningKey};
-use osprey_pro::{OfflineLicenseVerifier, OspreyLicense, ProLicenseError, LICENSE_TOKEN_PREFIX};
+use osprey_pro::{
+    OfflineLicenseVerifier, OspreyLicense, ProLicenseError, COMMUNITY_MAX_VECTORS,
+    LICENSE_TOKEN_PREFIX,
+};
 use rand::rngs::OsRng;
 use thiserror::Error;
 
 const ALL_PRO_FEATURES: &[&str] = &[
+    "wal_streaming",
+    "cow_compactor",
+    "tombstone_gc",
+    "s3_cas_manifest",
+    "arrow_flight",
+    "rerank_http",
+    "qdrant_compat",
+];
+
+/// Feature set for Beta / Design Partner tier (90-day free).
+const BETA_FEATURES: &[&str] = &[
+    "wal_streaming",
+    "cow_compactor",
+    "qdrant_compat",
+];
+
+/// Feature set for Founding tier (discounted Early Access, 1-year).
+const FOUNDING_FEATURES: &[&str] = &[
+    "wal_streaming",
+    "cow_compactor",
+    "tombstone_gc",
+    "s3_cas_manifest",
+    "arrow_flight",
+    "rerank_http",
+    "qdrant_compat",
+];
+
+/// Feature set for Enterprise tier (unlimited scale, multi-node, Arrow Flight).
+const ENTERPRISE_FEATURES: &[&str] = &[
     "wal_streaming",
     "cow_compactor",
     "tombstone_gc",
@@ -72,23 +108,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Sign and emit an OSPREY-PRO-v1.<payload>.<sig> license string.
     Sign(SignArgs),
-
-    /// Generate a fresh Ed25519 signing/verifying keypair for developer/KMS use.
     Keygen(KeygenArgs),
-
-    /// Verify an OSPREY-PRO-v1 token offline using a public key or the embedded key.
     Verify(VerifyArgs),
 }
 
 #[derive(Debug, Args)]
 struct SignArgs {
-    /// Customer organization identifier (`customer_org`).
     #[arg(long = "org", visible_alias = "customer-org")]
     customer_org: Option<String>,
 
-    /// Commercial plan tier (`"enterprise"`, `"pro"`, `"team"`, `"oem"`).
+    /// Commercial plan tier: `beta`, `founding`, `enterprise`, or custom.
     #[arg(long, default_value = "enterprise")]
     tier: String,
 
@@ -96,27 +126,27 @@ struct SignArgs {
     #[arg(long, default_value_t = 0)]
     max_nodes: u32,
 
-    /// Issuance timestamp in Unix seconds UTC (defaults to current system clock).
+    /// Maximum vector count (`0` = unlimited, `5_000_000` = community default).
+    #[arg(long, default_value_t = 0)]
+    max_vectors: u64,
+
     #[arg(long)]
     issued_at: Option<u64>,
 
-    /// Explicit expiration timestamp in Unix seconds UTC.
     #[arg(long, conflicts_with = "ttl_days")]
     expires_at: Option<u64>,
 
     /// Validity period in days from `issued_at` (used when `--expires-at` is omitted).
+    ///   90 days = Beta Design Partners, 365 days = Founding/Enterprise.
     #[arg(long, default_value_t = 365)]
     ttl_days: u64,
 
-    /// Comma-separated or repeated feature flags.
     #[arg(long = "features", value_delimiter = ',')]
     features: Vec<String>,
 
-    /// Enable all canonical osprey-pro commercial capabilities.
     #[arg(long)]
     all_features: bool,
 
-    /// Ed25519 private key (32-byte seed in hex or base64/base64url).
     #[arg(
         long,
         env = "OSPREY_PRO_SIGNING_KEY",
@@ -124,41 +154,33 @@ struct SignArgs {
     )]
     private_key: Option<String>,
 
-    /// Path to file containing the 32-byte Ed25519 private key (raw binary, hex, or base64).
     #[arg(long)]
     private_key_file: Option<PathBuf>,
 
-    /// Emit JSON metadata alongside the signed token.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct KeygenArgs {
-    /// Output path for the 32-byte raw Ed25519 private key (NEVER commit to git).
     #[arg(long)]
     out_private: Option<PathBuf>,
 
-    /// Output path for the 32-byte raw Ed25519 public key (for `include_bytes!`).
     #[arg(long)]
     out_public: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct VerifyArgs {
-    /// License string `OSPREY-PRO-v1.<payload>.<sig>` to verify.
     #[arg(long)]
     token: String,
 
-    /// Optional 32-byte Ed25519 public key (hex or base64/base64url). Uses embedded key if omitted.
     #[arg(long, conflicts_with = "public_key_file")]
     public_key: Option<String>,
 
-    /// Optional path to 32-byte Ed25519 public key file (raw binary, hex, or base64).
     #[arg(long)]
     public_key_file: Option<PathBuf>,
 
-    /// Optional Unix timestamp override for deterministic verification.
     #[arg(long)]
     now: Option<u64>,
 }
@@ -266,6 +288,43 @@ fn sign_license_token(
     Ok(format!("{signed_message}.{sig_b64}"))
 }
 
+/// Resolves the feature list based on tier and user-provided flags.
+fn resolve_features(tier: &str, provided: &[String], all: bool) -> Vec<String> {
+    if all {
+        let mut feats: Vec<String> = ALL_PRO_FEATURES.iter().map(|s| (*s).to_owned()).collect();
+        for p in provided {
+            if !feats.contains(p) {
+                feats.push(p.clone());
+            }
+        }
+        return feats;
+    }
+
+    if !provided.is_empty() {
+        return provided.to_vec();
+    }
+
+    match tier {
+        "beta" => BETA_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
+        "founding" => FOUNDING_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
+        "enterprise" => ENTERPRISE_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
+        _ => ALL_PRO_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
+    }
+}
+
+/// Resolves max_vectors based on tier: founding/enterprise are unlimited (0),
+/// beta defaults to 100k, others keep user-provided value.
+fn resolve_max_vectors(tier: &str, user_value: u64) -> u64 {
+    if user_value != 0 {
+        return user_value;
+    }
+    match tier {
+        "founding" | "enterprise" => 0,
+        "beta" => 100_000,
+        _ => COMMUNITY_MAX_VECTORS,
+    }
+}
+
 fn run_sign(args: SignArgs) -> Result<(), KeygenError> {
     let customer_org = args
         .customer_org
@@ -292,19 +351,14 @@ fn run_sign(args: SignArgs) -> Result<(), KeygenError> {
         });
     }
 
-    let mut features = args.features;
-    if args.all_features {
-        for &cap in ALL_PRO_FEATURES {
-            if !features.iter().any(|existing| existing == cap) {
-                features.push(cap.to_owned());
-            }
-        }
-    }
+    let features = resolve_features(&args.tier, &args.features, args.all_features);
+    let max_vectors = resolve_max_vectors(&args.tier, args.max_vectors);
 
     let license = OspreyLicense {
         customer_org,
         tier: args.tier,
         max_nodes: args.max_nodes,
+        max_vectors,
         issued_at,
         expires_at,
         features,
@@ -423,6 +477,7 @@ mod tests {
             customer_org: "fintech-prod".to_owned(),
             tier: "enterprise".to_owned(),
             max_nodes: 8,
+            max_vectors: 0,
             issued_at: now - 10,
             expires_at: now + 86_400 * 90,
             features: vec!["wal_streaming".to_owned(), "s3_cas_manifest".to_owned()],
@@ -445,5 +500,27 @@ mod tests {
 
         assert_eq!(decode_32_bytes_text(&hex_str).unwrap(), raw);
         assert_eq!(decode_32_bytes_text(&b64_str).unwrap(), raw);
+    }
+
+    #[test]
+    fn tier_resolves_correct_features_and_vector_limits() {
+        assert_eq!(
+            resolve_features("beta", &[], false),
+            BETA_FEATURES.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            resolve_features("founding", &[], false),
+            FOUNDING_FEATURES.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            resolve_features("enterprise", &[], false),
+            ENTERPRISE_FEATURES.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+        );
+
+        assert_eq!(resolve_max_vectors("founding", 0), 0);
+        assert_eq!(resolve_max_vectors("enterprise", 0), 0);
+        assert_eq!(resolve_max_vectors("beta", 0), 100_000);
+        assert_eq!(resolve_max_vectors("beta", 5000), 5000);
+        assert_eq!(resolve_max_vectors("unknown", 0), COMMUNITY_MAX_VECTORS);
     }
 }

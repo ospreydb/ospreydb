@@ -16,9 +16,10 @@ use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use osprey_core::RawVectorRecord;
 use osprey_pro::{
-    build_http_router, ClusterManifest, CompactorConfig, CowSlabCompactor, HttpServerState,
-    HybridSearchEngine, LsmDeltaBuffer, LutRankReranker, ManifestStore, OspreyFlightService,
-    ProMetricsRegistry, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
+    build_http_router, ClusterManifest, CompactorConfig, CowSlabCompactor, Embedder,
+    EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
+    ManifestStore, OspreyFlightService, ProMetricsRegistry, DEFAULT_LUTRANK_SEED,
+    DEFAULT_MANIFEST_KEY,
 };
 use osprey_storage::{
     MinipageLruCache, OsvWriterConfig, RemoteStoreConfig, WarpConfig, DEFAULT_MINIPAGE_CACHE_BYTES,
@@ -348,7 +349,11 @@ async fn dropin_cohere_rerank_qdrant_search_and_prometheus_metrics_e2e() {
     assert!(engine.refresh_from_manifest().await.unwrap());
 
     let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED).unwrap());
-    let state = HttpServerState::new(reranker, Arc::clone(&metrics));
+    let state = HttpServerState::new(
+        reranker,
+        Arc::new(Embedder::new(EmbedderConfig::default())),
+        Arc::clone(&metrics),
+    );
     state
         .register_collection("papers", Arc::clone(&engine))
         .unwrap();

@@ -1,10 +1,11 @@
 //! Drop-in HTTP servers for Cohere/Jina (`POST /v1/rerank`), Qdrant (`:6333`
-//! `POST /collections/{name}/points/search`), and Prometheus (`GET /metrics`).
+//! `POST /collections/{name}/points/search`), Prometheus (`GET /metrics`), and
+//! built-in Auto-Embeddings `/v1/embeddings` (OpenAI-compatible contract).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -17,35 +18,43 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::delta_buffer::HybridSearchEngine;
+use crate::embedder::Embedder;
 use crate::error::{ProEngineError, ProResult};
+use crate::license::{OspreyLicense, COMMUNITY_MAX_VECTORS};
 use crate::metrics::ProMetricsRegistry;
 use crate::rerank_service::LutRankReranker;
 
-/// Default Qdrant-compatible HTTP bind address (`:6333`).
 pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:6333";
 
-/// Shared application state powering all drop-in HTTP routes and `/metrics`.
 #[derive(Clone, Debug)]
 pub struct HttpServerState {
     collections: Arc<RwLock<HashMap<String, Arc<HybridSearchEngine>>>>,
     reranker: Arc<LutRankReranker>,
+    embedder: Arc<Embedder>,
     metrics: Arc<ProMetricsRegistry>,
     default_nprobe: usize,
+    total_vectors: Arc<AtomicU64>,
+    active_license: Arc<RwLock<Option<OspreyLicense>>>,
 }
 
 impl HttpServerState {
-    /// Creates a new [`HttpServerState`] with a shared [`LutRankReranker`] and [`ProMetricsRegistry`].
     #[must_use]
-    pub fn new(reranker: Arc<LutRankReranker>, metrics: Arc<ProMetricsRegistry>) -> Self {
+    pub fn new(
+        reranker: Arc<LutRankReranker>,
+        embedder: Arc<Embedder>,
+        metrics: Arc<ProMetricsRegistry>,
+    ) -> Self {
         Self {
             collections: Arc::new(RwLock::new(HashMap::new())),
             reranker,
+            embedder,
             metrics,
             default_nprobe: 16,
+            total_vectors: Arc::new(AtomicU64::new(0)),
+            active_license: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Registers or replaces a named collection engine for Qdrant-compatible routes.
     pub fn register_collection(
         &self,
         name: impl Into<String>,
@@ -58,22 +67,56 @@ impl HttpServerState {
         Ok(())
     }
 
-    /// Resolves a collection engine by name.
     pub fn get_collection(&self, name: &str) -> ProResult<Option<Arc<HybridSearchEngine>>> {
         let guard = self.collections.read().map_err(|_| {
             ProEngineError::Io(std::io::Error::other("collections RwLock poisoned"))
         })?;
         Ok(guard.get(name).cloned())
     }
+
+    /// Activates a Pro license, unlocking unlimited vectors and multi-node features.
+    pub fn activate_license(&self, license: OspreyLicense) {
+        if let Ok(mut guard) = self.active_license.write() {
+            *guard = Some(license);
+        }
+    }
+
+    /// Returns the current vector count across all collections.
+    pub fn total_vector_count(&self) -> u64 {
+        self.total_vectors.load(Ordering::Acquire)
+    }
+
+    /// Checks whether the total vector count is allowed under the active license.
+    /// Returns `Ok(())` if allowed, or `ProEngineError::CommunityTierLimitReached` if blocked.
+    pub fn check_vector_limit(&self, additional: u64) -> Result<(), ProEngineError> {
+        let license_guard = self
+            .active_license
+            .read()
+            .map_err(|_| ProEngineError::Io(std::io::Error::other("license RwLock poisoned")))?;
+        let max_vectors = license_guard
+            .as_ref()
+            .map_or(COMMUNITY_MAX_VECTORS, |lic| lic.max_vectors);
+        if max_vectors == 0 {
+            return Ok(());
+        }
+        let current = self.total_vectors.load(Ordering::Acquire);
+        if current.saturating_add(additional) > max_vectors {
+            return Err(ProEngineError::CommunityTierLimitReached { limit: max_vectors });
+        }
+        Ok(())
+    }
+
+    pub fn increment_vector_count(&self, delta: u64) {
+        self.total_vectors.fetch_add(delta, Ordering::Release);
+    }
 }
 
-/// Builds the Axum [`Router`] exposing Cohere/Jina `/v1/rerank`, Qdrant `/collections/...`,
-/// `/healthz`, and Prometheus `/metrics`.
 pub fn build_http_router(state: HttpServerState) -> Router {
     Router::new()
         .route("/healthz", get(handle_healthz))
         .route("/metrics", get(handle_metrics))
         .route("/v1/rerank", post(handle_cohere_rerank))
+        .route("/v1/embeddings", post(handle_embeddings))
         .route(
             "/collections/{name}/points/search",
             post(handle_qdrant_search),
@@ -83,7 +126,6 @@ pub fn build_http_router(state: HttpServerState) -> Router {
         .with_state(state)
 }
 
-/// Binds and runs the drop-in HTTP server on `addr` until `shutdown` resolves.
 pub async fn serve_http<F>(addr: SocketAddr, state: HttpServerState, shutdown: F) -> ProResult<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -113,17 +155,11 @@ async fn handle_metrics(State(state): State<HttpServerState>) -> Response {
         .into_response()
 }
 
-/// Cohere / Jina document input: either plain string or `{"text": "..."}`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum RerankDocumentInput {
-    /// Raw document text.
     Text(String),
-    /// Structured document object with `"text"` field.
-    Object {
-        /// Document text body.
-        text: String,
-    },
+    Object { text: String },
 }
 
 impl RerankDocumentInput {
@@ -135,18 +171,12 @@ impl RerankDocumentInput {
     }
 }
 
-/// Cohere / Jina compatible `POST /v1/rerank` request payload.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CohereRerankRequest {
-    /// Optional model identifier (logged/ignored; executed via local `LUT-Rank`).
     pub model: Option<String>,
-    /// Query text to score documents against.
     pub query: String,
-    /// Candidate documents to rerank.
     pub documents: Vec<RerankDocumentInput>,
-    /// Maximum number of top results to return.
     pub top_n: Option<usize>,
-    /// Whether to include document text in each result object.
     pub return_documents: Option<bool>,
 }
 
@@ -222,30 +252,21 @@ async fn handle_cohere_rerank(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-/// Optional Qdrant search tuning parameters.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct QdrantSearchParams {
-    /// Oversampling factor / probe hint mapped to `top_m` candidate budget.
     pub hnsw_ef: Option<usize>,
-    /// Explicit cluster probe count.
     pub nprobe: Option<usize>,
 }
 
-/// Qdrant compatible `POST /collections/{name}/points/search` request body.
 #[derive(Clone, Debug, Deserialize)]
 pub struct QdrantSearchRequest {
-    /// Dense query vector.
-    pub vector: Vec<f32>,
-    /// Number of top results to return.
+    pub vector: Option<Vec<f32>>,
+    pub query_text: Option<String>,
     #[serde(default = "default_qdrant_limit")]
     pub limit: usize,
-    /// Optional result offset for pagination.
     pub offset: Option<usize>,
-    /// Whether to return JSON payloads (default: `true`).
     pub with_payload: Option<bool>,
-    /// Optional minimum exact score cutoff.
     pub score_threshold: Option<f32>,
-    /// Optional search parameters.
     pub params: Option<QdrantSearchParams>,
 }
 
@@ -267,7 +288,7 @@ async fn handle_qdrant_search(
     Path(collection_name): Path<String>,
     Json(req): Json<QdrantSearchRequest>,
 ) -> Response {
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let engine = match state.get_collection(&collection_name) {
         Ok(Some(eng)) => eng,
         Ok(None) => {
@@ -289,6 +310,33 @@ async fn handle_qdrant_search(
         }
     };
 
+    let query_vec = match (req.vector, req.query_text) {
+        (Some(v), _) if !v.is_empty() => v,
+        (_, Some(ref text)) => match state.embedder.embed_one(text).await {
+            Ok(emb) => emb,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "status": { "error": format!("embedding query_text failed: {err}") },
+                        "time": start.elapsed().as_secs_f64()
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": { "error": "either 'vector' or 'query_text' is required" },
+                    "time": start.elapsed().as_secs_f64()
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let offset = req.offset.unwrap_or(0);
     let fetch_k = req.limit.saturating_add(offset);
     let params = req.params.unwrap_or_default();
@@ -298,7 +346,7 @@ async fn handle_qdrant_search(
         .unwrap_or_else(|| fetch_k.saturating_mul(8).max(64));
 
     let results = match engine
-        .search_hybrid_async(&req.vector, nprobe, top_m, fetch_k)
+        .search_hybrid_async(&query_vec, nprobe, top_m, fetch_k)
         .await
     {
         Ok(r) => r,
@@ -357,21 +405,17 @@ async fn handle_qdrant_search(
         .into_response()
 }
 
-/// Qdrant-compatible upsert point entry (`PUT /collections/{name}/points`).
 #[derive(Clone, Debug, Deserialize)]
 pub struct QdrantPointStruct {
-    /// Numeric point ID.
     pub id: u64,
-    /// Dense vector.
+    #[serde(default)]
     pub vector: Vec<f32>,
-    /// Optional JSON payload.
+    pub text: Option<String>,
     pub payload: Option<Value>,
 }
 
-/// Qdrant-compatible batch upsert payload (`PUT /collections/{name}/points`).
 #[derive(Clone, Debug, Deserialize)]
 pub struct QdrantUpsertRequest {
-    /// Points to upsert into WAL + `LsmDeltaBuffer`.
     pub points: Vec<QdrantPointStruct>,
 }
 
@@ -380,7 +424,7 @@ async fn handle_qdrant_upsert(
     Path(collection_name): Path<String>,
     Json(req): Json<QdrantUpsertRequest>,
 ) -> Response {
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let engine = match state.get_collection(&collection_name) {
         Ok(Some(eng)) => eng,
         Ok(None) => {
@@ -399,6 +443,73 @@ async fn handle_qdrant_upsert(
         }
     };
 
+    // Collect texts that need embedding
+    let mut texts_to_embed: Vec<String> = Vec::new();
+    let mut text_indices: Vec<usize> = Vec::new();
+    for (idx, point) in req.points.iter().enumerate() {
+        if let Some(ref text) = point.text {
+            if point.vector.is_empty() {
+                texts_to_embed.push(text.clone());
+                text_indices.push(idx);
+            }
+        }
+    }
+
+    let embedding_count = u64::try_from(texts_to_embed.len()).unwrap_or(0);
+
+    // Enforce community tier vector limit
+    if let Err(limit_err) = state.check_vector_limit(
+        u64::try_from(req.points.len()).unwrap_or(0)
+    ) {
+        let status_code = if matches!(limit_err, ProEngineError::CommunityTierLimitReached { .. }) {
+            StatusCode::from_u16(402).unwrap_or(StatusCode::PAYMENT_REQUIRED)
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return (
+            status_code,
+            Json(json!({
+                "status": {
+                    "error": format!("{limit_err}"),
+                    "current_count": state.total_vector_count(),
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let embedded: Vec<Vec<f32>> = if !texts_to_embed.is_empty() {
+        match state.embedder.embed_batch(&texts_to_embed).await {
+            Ok(emb) => emb,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "status": {
+                            "error": format!("embedding text failed: {err}")
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Build records: use explicit vector or embedded text vector
+    let needs_vector_context = if !embedded.is_empty() {
+        let mut map = HashMap::with_capacity(embedded.len());
+        for (emb_idx, point_idx) in text_indices.iter().enumerate() {
+            if emb_idx < embedded.len() {
+                map.insert(*point_idx, embedded[emb_idx].clone());
+            }
+        }
+        Some(map)
+    } else {
+        None
+    };
+
     let payload_bytes: Vec<Vec<u8>> = req
         .points
         .iter()
@@ -411,21 +522,45 @@ async fn handle_qdrant_upsert(
     let records: Vec<RawVectorRecord<'_>> = req
         .points
         .iter()
+        .enumerate()
         .zip(payload_bytes.iter())
-        .map(|(p, payload)| RawVectorRecord {
-            doc_id: p.id,
-            vector: &p.vector,
-            payload_json: payload,
+        .filter_map(|((idx, p), payload)| {
+let vector_ref = if !p.vector.is_empty() {
+                Some(p.vector.as_slice())
+            } else if let Some(ctx) = &needs_vector_context {
+                ctx.get(&idx).map(|v| v.as_slice())
+            } else {
+                None
+            };
+            vector_ref.map(|v| RawVectorRecord {
+                doc_id: p.id,
+                vector: v,
+                payload_json: payload,
+            })
         })
         .collect();
 
+    if records.is_empty() && !req.points.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": { "error": "points require either 'vector' or 'text' for embedding" } })),
+        )
+            .into_response();
+    }
+
+    let ingested_count = records.len();
     match engine.delta_buffer().ingest_batch(&records) {
         Ok(seq) => {
-            state.metrics.observe_wal_ingest(records.len());
+            state.metrics.observe_wal_ingest(ingested_count);
+            state.increment_vector_count(u64::try_from(ingested_count).unwrap_or(0));
             (
                 StatusCode::OK,
                 Json(json!({
-                    "result": { "operation_id": seq, "status": "completed" },
+                    "result": {
+                        "operation_id": seq,
+                        "status": "completed",
+                        "embedded_texts": embedding_count,
+                    },
                     "status": "ok",
                     "time": start.elapsed().as_secs_f64()
                 })),
@@ -444,7 +579,7 @@ async fn handle_qdrant_collection_info(
     State(state): State<HttpServerState>,
     Path(collection_name): Path<String>,
 ) -> Response {
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let engine = match state.get_collection(&collection_name) {
         Ok(Some(eng)) => eng,
         Ok(None) => {
@@ -465,6 +600,26 @@ async fn handle_qdrant_collection_info(
 
     let delta_live = engine.delta_buffer().live_count().unwrap_or(0);
     let segments = engine.loaded_segment_count().unwrap_or(0);
+    let total_vecs = state.total_vector_count();
+    let license_info = state
+        .active_license
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|lic| {
+            json!({
+                "tier": lic.tier,
+                "max_vectors": lic.max_vectors,
+                "is_unlimited": lic.is_unlimited_vectors(),
+            })
+        }))
+        .unwrap_or_else(|| {
+            json!({
+                "tier": "community",
+                "max_vectors": COMMUNITY_MAX_VECTORS,
+                "is_unlimited": false,
+            })
+        });
+
     (
         StatusCode::OK,
         Json(json!({
@@ -472,6 +627,12 @@ async fn handle_qdrant_collection_info(
                 "status": "green",
                 "segments_count": segments,
                 "delta_vectors_count": delta_live,
+                "total_vectors_count": total_vecs,
+                "license": license_info,
+                "embedder": {
+                    "configured": state.embedder.is_configured(),
+                    "model": state.embedder.model(),
+                },
                 "config": {
                     "params": {
                         "vectors": {
@@ -486,4 +647,93 @@ async fn handle_qdrant_collection_info(
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Built-in OpenAI-compatible /v1/embeddings endpoint (zero ONNX/Torch)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+struct EmbeddingsRequest {
+    model: Option<String>,
+    input: EmbeddingsInput,
+    #[allow(dead_code)]
+    #[serde(default)]
+    encoding_format: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingsInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EmbeddingsUsage {
+    prompt_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EmbeddingsDataItem {
+    object: String,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EmbeddingsResponse {
+    object: String,
+    data: Vec<EmbeddingsDataItem>,
+    model: String,
+    usage: EmbeddingsUsage,
+}
+
+async fn handle_embeddings(
+    State(state): State<HttpServerState>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Response {
+    let model = req
+        .model
+        .unwrap_or_else(|| state.embedder.model().to_owned());
+
+    let texts: Vec<String> = match req.input {
+        EmbeddingsInput::Single(s) => vec![s],
+        EmbeddingsInput::Batch(arr) => arr,
+    };
+
+    match state.embedder.embed_batch(&texts).await {
+        Ok(embeddings) => {
+            let data: Vec<EmbeddingsDataItem> = embeddings
+                .into_iter()
+                .enumerate()
+                .map(|(idx, embedding)| EmbeddingsDataItem {
+                    object: "embedding".to_owned(),
+                    embedding,
+                    index: idx,
+                })
+                .collect();
+            let token_count = texts
+                .iter()
+                .map(|t| t.split_whitespace().count() as u64)
+                .sum::<u64>()
+                .max(1);
+            let resp = EmbeddingsResponse {
+                object: "list".to_owned(),
+                data,
+                model,
+                usage: EmbeddingsUsage {
+                    prompt_tokens: token_count,
+                    total_tokens: token_count,
+                },
+            };
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": err.to_string(), "type": "server_error" } })),
+        )
+            .into_response(),
+    }
 }

@@ -115,6 +115,16 @@ pub enum ProEngineError {
     #[error("license error: {0}")]
     License(#[from] ProLicenseError),
 
+    /// Community tier hard vector limit reached (5M) — requires a Pro license activation.
+    #[error(
+        "Community Tier limit ({limit} vectors) reached. Activate Founding or Enterprise \
+         license via 'osprey pro activate --license <KEY>' — see https://ospreydb.dev/pricing"
+    )]
+    CommunityTierLimitReached {
+        /// Hard limit (defaults to [`crate::license::COMMUNITY_MAX_VECTORS`]).
+        limit: u64,
+    },
+
     /// WAL file magic bytes did not match `"OPWL"`.
     #[error("invalid WAL magic: expected [0x4f, 0x50, 0x57, 0x4c], found {found:?}")]
     InvalidWalMagic {
