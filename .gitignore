@@ -42,6 +42,15 @@ heaptrack.*
 .env
 .env.*
 !.env.example
+infra/ci/.env
+
+# Self-hosted CI/CD runner & build caches
+infra/ci/.cache/
+cargo-cache/
+sccache/
+.sccache/
+dist/
+dist-docker/
 
 # OS & editor junk
 .DS_Store
