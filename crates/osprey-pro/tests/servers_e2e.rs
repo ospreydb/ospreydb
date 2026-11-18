@@ -18,8 +18,8 @@ use osprey_core::RawVectorRecord;
 use osprey_pro::{
     build_http_router, ClusterManifest, CompactorConfig, CowSlabCompactor, Embedder,
     EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
-    ManifestStore, OspreyFlightService, ProMetricsRegistry, DEFAULT_LUTRANK_SEED,
-    DEFAULT_MANIFEST_KEY,
+    ManifestStore, OspreyFlightService, ProMetricsRegistry, VectorQuotaState,
+    COMMUNITY_MAX_VECTORS, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
 };
 use osprey_storage::{
     MinipageLruCache, OsvWriterConfig, RemoteStoreConfig, WarpConfig, DEFAULT_MINIPAGE_CACHE_BYTES,
@@ -451,6 +451,173 @@ async fn dropin_cohere_rerank_qdrant_search_and_prometheus_metrics_e2e() {
     assert!(prom_text.contains("osprey_pro_warp_solver_duration_microseconds_count"));
     assert!(prom_text.contains("osprey_pro_s3_calls_saved_total"));
     assert!(prom_text.contains("osprey_pro_lutrank_tokens_per_sec"));
+
+    let _ = tx.send(());
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn arrow_flight_blocks_do_put_at_community_limit_while_reads_keep_working() {
+    let dim = 64_usize;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let manifest_store = ManifestStore::new(Arc::clone(&store), DEFAULT_MANIFEST_KEY);
+    manifest_store
+        .create_if_absent(&ClusterManifest::new_empty())
+        .await
+        .unwrap();
+
+    let delta = Arc::new(LsmDeltaBuffer::new(dim, dim, 77, Vec::new(), None).unwrap());
+    let existing_vec = basis_vec(dim, 3);
+    delta
+        .ingest_batch(&[RawVectorRecord {
+            doc_id: 777,
+            vector: &existing_vec,
+            payload_json: br#"{"doc":"existing"}"#,
+        }])
+        .unwrap();
+
+    let engine = Arc::new(HybridSearchEngine::new(
+        Arc::clone(&delta),
+        Arc::clone(&store),
+        manifest_store,
+        Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
+        RemoteStoreConfig::default(),
+        WarpConfig::default(),
+    ));
+    let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED).unwrap());
+    let quota = VectorQuotaState::with_initial_vectors(COMMUNITY_MAX_VECTORS);
+    let svc = OspreyFlightService::with_quota(Arc::clone(&engine), reranker, quota);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let server_handle = tokio::spawn(async move {
+        let incoming = TcpListenerStream::new(listener);
+        tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(svc))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let endpoint = format!("http://{addr}");
+    let mut client = FlightServiceClient::connect(endpoint).await.unwrap();
+
+    // 1. DoPut must reject new vectors when Community Tier 5M limit is reached
+    let put_schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::UInt64, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                i32::try_from(dim).unwrap(),
+            ),
+            false,
+        ),
+    ]));
+    let new_vec = basis_vec(dim, 9);
+    let fsl = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        vec![Some(new_vec.into_iter().map(Some).collect::<Vec<_>>())],
+        i32::try_from(dim).unwrap(),
+    );
+    let put_batch = RecordBatch::try_new(
+        Arc::clone(&put_schema),
+        vec![Arc::new(UInt64Array::from(vec![888_u64])), Arc::new(fsl)],
+    )
+    .unwrap();
+    let flight_data: Vec<_> = FlightDataEncoderBuilder::new()
+        .with_schema(put_schema)
+        .build(stream::iter(vec![Ok(put_batch)]))
+        .try_collect()
+        .await
+        .unwrap();
+
+    let put_err = client
+        .do_put(stream::iter(flight_data))
+        .await
+        .expect_err("DoPut should reject inserts at 5M community limit");
+    assert_eq!(put_err.code(), tonic::Code::ResourceExhausted);
+    assert!(put_err.message().contains("Community Tier limit"));
+
+    // 2. DoExchange vector search must STILL work normally on the same node
+    let search_schema = Arc::new(Schema::new(vec![
+        Field::new("query_id", DataType::UInt64, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                i32::try_from(dim).unwrap(),
+            ),
+            false,
+        ),
+        Field::new("top_k", DataType::UInt32, false),
+    ]));
+    let search_fsl = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        vec![Some(existing_vec.into_iter().map(Some).collect::<Vec<_>>())],
+        i32::try_from(dim).unwrap(),
+    );
+    let search_batch = RecordBatch::try_new(
+        Arc::clone(&search_schema),
+        vec![
+            Arc::new(UInt64Array::from(vec![1_u64])),
+            Arc::new(search_fsl),
+            Arc::new(UInt32Array::from(vec![3_u32])),
+        ],
+    )
+    .unwrap();
+    let ex_data: Vec<_> = FlightDataEncoderBuilder::new()
+        .with_schema(search_schema)
+        .build(stream::iter(vec![Ok(search_batch)]))
+        .try_collect()
+        .await
+        .unwrap();
+    let resp_stream = client
+        .do_exchange(stream::iter(ex_data))
+        .await
+        .unwrap()
+        .into_inner();
+    let resp_batches: Vec<RecordBatch> =
+        FlightRecordBatchStream::new_from_flight_data(resp_stream.map_err(FlightError::Tonic))
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(resp_batches.len(), 1);
+    let top_docs = resp_batches[0]
+        .column_by_name("doc_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(top_docs.value(0), 777);
+
+    // 3. ListFlights & DoGet metadata must STILL work normally
+    let flights: Vec<_> = client
+        .list_flights(Criteria::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(flights.len(), 1);
+
+    let get_stream = client
+        .do_get(Ticket::new("segments"))
+        .await
+        .unwrap()
+        .into_inner();
+    let seg_batches: Vec<RecordBatch> =
+        FlightRecordBatchStream::new_from_flight_data(get_stream.map_err(FlightError::Tonic))
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(
+        seg_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0
+    );
 
     let _ = tx.send(());
     let _ = server_handle.await;

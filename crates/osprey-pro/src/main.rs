@@ -20,8 +20,8 @@ use osprey_pro::{
     serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder, EmbedderConfig,
     HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker, ManifestStore,
     OfflineLicenseVerifier, OspreyFlightService, OspreyWal, ProEngineError, ProMetricsRegistry,
-    ProResult, WalConfig, WalRecoveryMode, WalSyncPolicy, DEFAULT_ARROW_FLIGHT_ADDR,
-    DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
+    ProResult, VectorQuotaState, WalConfig, WalRecoveryMode, WalSyncPolicy,
+    DEFAULT_ARROW_FLIGHT_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
 };
 use osprey_storage::{
     build_object_store, MinipageLruCache, RemoteStoreConfig, WarpConfig,
@@ -195,13 +195,27 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
     let compactor_handle = compactor.spawn_background(Arc::clone(&delta), Some(wal));
 
     let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED)?);
-    let http_state = HttpServerState::new(Arc::clone(&reranker), embedder, Arc::clone(&metrics));
+    let initial_vectors = engine.total_live_vector_count()?;
+    let quota = VectorQuotaState::with_initial_vectors(initial_vectors);
     if let Some(lic) = active_license {
-        http_state.activate_license(lic);
+        quota.activate_license(lic);
+    } else if initial_vectors >= osprey_pro::COMMUNITY_MAX_VECTORS {
+        tracing::warn!(
+            total_vectors = initial_vectors,
+            max_vectors = osprey_pro::COMMUNITY_MAX_VECTORS,
+            "Community Tier 5M vector limit reached; node remains online in read/search-only mode for vectors"
+        );
     }
+
+    let http_state = HttpServerState::with_quota(
+        Arc::clone(&reranker),
+        embedder,
+        Arc::clone(&metrics),
+        quota.clone(),
+    );
     http_state.register_collection(&args.collection, Arc::clone(&engine))?;
 
-    let flight_service = OspreyFlightService::new(engine, reranker);
+    let flight_service = OspreyFlightService::with_quota(engine, reranker, quota);
 
     let shutdown_notify = Arc::new(Notify::new());
     let flight_shutdown = Arc::clone(&shutdown_notify);

@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use axum::extract::{Path, State};
@@ -20,7 +19,7 @@ use tokio::net::TcpListener;
 use crate::delta_buffer::HybridSearchEngine;
 use crate::embedder::Embedder;
 use crate::error::{ProEngineError, ProResult};
-use crate::license::{OspreyLicense, COMMUNITY_MAX_VECTORS};
+use crate::license::{OspreyLicense, VectorQuotaState, COMMUNITY_MAX_VECTORS};
 use crate::metrics::ProMetricsRegistry;
 use crate::rerank_service::LutRankReranker;
 
@@ -33,8 +32,7 @@ pub struct HttpServerState {
     embedder: Arc<Embedder>,
     metrics: Arc<ProMetricsRegistry>,
     default_nprobe: usize,
-    total_vectors: Arc<AtomicU64>,
-    active_license: Arc<RwLock<Option<OspreyLicense>>>,
+    quota: VectorQuotaState,
 }
 
 impl HttpServerState {
@@ -44,14 +42,23 @@ impl HttpServerState {
         embedder: Arc<Embedder>,
         metrics: Arc<ProMetricsRegistry>,
     ) -> Self {
+        Self::with_quota(reranker, embedder, metrics, VectorQuotaState::new())
+    }
+
+    #[must_use]
+    pub fn with_quota(
+        reranker: Arc<LutRankReranker>,
+        embedder: Arc<Embedder>,
+        metrics: Arc<ProMetricsRegistry>,
+        quota: VectorQuotaState,
+    ) -> Self {
         Self {
             collections: Arc::new(RwLock::new(HashMap::new())),
             reranker,
             embedder,
             metrics,
             default_nprobe: 16,
-            total_vectors: Arc::new(AtomicU64::new(0)),
-            active_license: Arc::new(RwLock::new(None)),
+            quota,
         }
     }
 
@@ -76,38 +83,23 @@ impl HttpServerState {
 
     /// Activates a Pro license, unlocking unlimited vectors and multi-node features.
     pub fn activate_license(&self, license: OspreyLicense) {
-        if let Ok(mut guard) = self.active_license.write() {
-            *guard = Some(license);
-        }
+        self.quota.activate_license(license);
     }
 
     /// Returns the current vector count across all collections.
+    #[must_use]
     pub fn total_vector_count(&self) -> u64 {
-        self.total_vectors.load(Ordering::Acquire)
+        self.quota.total_vector_count()
     }
 
     /// Checks whether the total vector count is allowed under the active license.
     /// Returns `Ok(())` if allowed, or `ProEngineError::CommunityTierLimitReached` if blocked.
     pub fn check_vector_limit(&self, additional: u64) -> Result<(), ProEngineError> {
-        let license_guard = self
-            .active_license
-            .read()
-            .map_err(|_| ProEngineError::Io(std::io::Error::other("license RwLock poisoned")))?;
-        let max_vectors = license_guard
-            .as_ref()
-            .map_or(COMMUNITY_MAX_VECTORS, |lic| lic.max_vectors);
-        if max_vectors == 0 {
-            return Ok(());
-        }
-        let current = self.total_vectors.load(Ordering::Acquire);
-        if current.saturating_add(additional) > max_vectors {
-            return Err(ProEngineError::CommunityTierLimitReached { limit: max_vectors });
-        }
-        Ok(())
+        self.quota.check_vector_limit(additional)
     }
 
     pub fn increment_vector_count(&self, delta: u64) {
-        self.total_vectors.fetch_add(delta, Ordering::Release);
+        self.quota.increment_vector_count(delta);
     }
 }
 
@@ -601,22 +593,26 @@ async fn handle_qdrant_collection_info(
     let delta_live = engine.delta_buffer().live_count().unwrap_or(0);
     let segments = engine.loaded_segment_count().unwrap_or(0);
     let total_vecs = state.total_vector_count();
+    let limit_reached = state.quota.is_limit_reached();
     let license_info = state
-        .active_license
-        .read()
-        .ok()
-        .and_then(|g| g.as_ref().map(|lic| {
+        .quota
+        .active_license_snapshot()
+        .map(|lic| {
             json!({
                 "tier": lic.tier,
                 "max_vectors": lic.max_vectors,
                 "is_unlimited": lic.is_unlimited_vectors(),
+                "limit_reached": limit_reached,
+                "read_only": limit_reached,
             })
-        }))
+        })
         .unwrap_or_else(|| {
             json!({
                 "tier": "community",
                 "max_vectors": COMMUNITY_MAX_VECTORS,
                 "is_unlimited": false,
+                "limit_reached": limit_reached,
+                "read_only": limit_reached,
             })
         });
 

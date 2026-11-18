@@ -809,6 +809,24 @@ impl HybridSearchEngine {
         Ok(guard.len())
     }
 
+    /// Returns the total live vector count across loaded segments and the in-memory delta buffer.
+    pub fn total_live_vector_count(&self) -> ProResult<u64> {
+        let seg_guard = self
+            .segments
+            .read()
+            .map_err(|_| ProEngineError::Io(std::io::Error::other("segments RwLock poisoned")))?;
+        let seg_live: u64 = seg_guard
+            .iter()
+            .map(|seg| {
+                let total = seg.osi.header().num_vectors;
+                let dead = seg.tombstones.len().max(seg.osi.tombstones().len());
+                total.saturating_sub(dead)
+            })
+            .sum();
+        let delta_live = u64::try_from(self.delta.live_count()?).unwrap_or(0);
+        Ok(seg_live.saturating_add(delta_live))
+    }
+
     /// Polls `manifest.json` via `HeadObject` ETag check and incrementally loads any new
     /// immutable `.osi` + `.osv` segment metadata without ZooKeeper or etcd.
     ///

@@ -7,7 +7,8 @@
 //! `"OSPREY-PRO-v1." || <base64url_payload>`
 
 use std::io::{Error as IoError, ErrorKind};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -16,7 +17,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use osprey_core::{LicenseClaims, LicenseGuard, OspreyError, OspreyResult, ProCapability};
 use serde::{Deserialize, Serialize};
 
-use crate::error::ProLicenseError;
+use crate::error::{ProEngineError, ProLicenseError, ProResult};
 
 /// Canonical token version prefix.
 pub const LICENSE_TOKEN_PREFIX: &str = "OSPREY-PRO-v1";
@@ -394,6 +395,98 @@ fn validate_claims(license: &OspreyLicense, now_unix_secs: u64) -> Result<(), Pr
         });
     }
     Ok(())
+}
+
+/// Shared thread-safe vector quota tracker enforced across HTTP and Arrow Flight ingestion.
+///
+/// When the active limit (`5_000_000` in Community Tier) is reached, read/search/rerank
+/// operations remain fully operational while new vector insertions are rejected.
+#[derive(Clone, Debug, Default)]
+pub struct VectorQuotaState {
+    total_vectors: Arc<AtomicU64>,
+    active_license: Arc<RwLock<Option<OspreyLicense>>>,
+}
+
+impl VectorQuotaState {
+    /// Creates a new [`VectorQuotaState`] starting at zero vectors with no Pro license.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a [`VectorQuotaState`] initialized with `initial_vectors` recovered from storage.
+    #[must_use]
+    pub fn with_initial_vectors(initial_vectors: u64) -> Self {
+        Self {
+            total_vectors: Arc::new(AtomicU64::new(initial_vectors)),
+            active_license: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Activates a verified commercial [`OspreyLicense`], updating the vector ceiling.
+    pub fn activate_license(&self, license: OspreyLicense) {
+        if let Ok(mut guard) = self.active_license.write() {
+            *guard = Some(license);
+        }
+    }
+
+    /// Returns a snapshot of the currently active license, if any.
+    #[must_use]
+    pub fn active_license_snapshot(&self) -> Option<OspreyLicense> {
+        self.active_license
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Returns the tracked total vector count across all collections.
+    #[must_use]
+    pub fn total_vector_count(&self) -> u64 {
+        self.total_vectors.load(Ordering::Acquire)
+    }
+
+    /// Sets the tracked total vector count (e.g. after WAL and manifest recovery).
+    pub fn set_vector_count(&self, count: u64) {
+        self.total_vectors.store(count, Ordering::Release);
+    }
+
+    /// Increments the tracked total vector count by `delta` after successful ingestion.
+    pub fn increment_vector_count(&self, delta: u64) {
+        self.total_vectors.fetch_add(delta, Ordering::Release);
+    }
+
+    /// Returns the effective maximum vector limit (`0` = unlimited).
+    pub fn max_vectors(&self) -> ProResult<u64> {
+        let guard = self
+            .active_license
+            .read()
+            .map_err(|_| ProEngineError::Io(IoError::other("license RwLock poisoned")))?;
+        Ok(guard
+            .as_ref()
+            .map_or(COMMUNITY_MAX_VECTORS, |lic| lic.max_vectors))
+    }
+
+    /// Returns `true` if the vector cap has been reached (insertions blocked, reads allowed).
+    #[must_use]
+    pub fn is_limit_reached(&self) -> bool {
+        match self.max_vectors() {
+            Ok(0) | Err(_) => false,
+            Ok(limit) => self.total_vector_count() >= limit,
+        }
+    }
+
+    /// Checks whether `additional` new vectors can be ingested under the active license.
+    pub fn check_vector_limit(&self, additional: u64) -> ProResult<()> {
+        let max_vectors = self.max_vectors()?;
+        if max_vectors == 0 {
+            return Ok(());
+        }
+        let current = self.total_vector_count();
+        if additional > 0 && current.saturating_add(additional) > max_vectors {
+            return Err(ProEngineError::CommunityTierLimitReached { limit: max_vectors });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

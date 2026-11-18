@@ -37,8 +37,8 @@ pub use http_server::{
 };
 pub use license::{
     capability_from_str, capability_name, Ed25519LicenseVerifier, OfflineLicenseVerifier,
-    OspreyLicense, COMMUNITY_MAX_VECTORS, EMBEDDED_PUBLIC_KEY, LICENSE_TOKEN_PREFIX,
-    MAX_CLOCK_SKEW_SECS, MAX_LICENSE_TOKEN_BYTES,
+    OspreyLicense, VectorQuotaState, COMMUNITY_MAX_VECTORS, EMBEDDED_PUBLIC_KEY,
+    LICENSE_TOKEN_PREFIX, MAX_CLOCK_SKEW_SECS, MAX_LICENSE_TOKEN_BYTES,
 };
 pub use manifest::{
     ClusterManifest, ManifestSnapshot, ManifestStore, SegmentDescriptor, DEFAULT_MANIFEST_KEY,

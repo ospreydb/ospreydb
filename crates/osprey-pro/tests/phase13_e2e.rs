@@ -59,6 +59,14 @@ async fn community_tier_limit_returns_402_payment_required() {
     state.register_collection("test", engine).unwrap();
 
     // Exhaust the community tier limit (simulate 5M vectors already stored)
+    let seed_vec = basis_vec(dim, 0);
+    delta
+        .ingest_batch(&[osprey_pro::RawVectorRecord {
+            doc_id: 42,
+            vector: &seed_vec,
+            payload_json: br#"{"title":"existing-doc"}"#,
+        }])
+        .unwrap();
     state.increment_vector_count(COMMUNITY_MAX_VECTORS);
 
     // Try to upsert one more vector -> should get 402
@@ -94,6 +102,39 @@ async fn community_tier_limit_returns_402_payment_required() {
     let error_msg = body["status"]["error"].as_str().unwrap();
     assert!(error_msg.contains("Community Tier limit"));
     assert!(error_msg.contains("5"));
+
+    // Verify engine keeps running normally in read/search-only mode after hitting 5M limit
+    let search_resp = client
+        .post(format!("{base_url}/collections/test/points/search"))
+        .json(&json!({
+            "vector": seed_vec,
+            "limit": 3,
+            "with_payload": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(search_resp.status().as_u16(), 200);
+    let search_json: Value = search_resp.json().await.unwrap();
+    assert_eq!(search_json["status"], "ok");
+    assert_eq!(search_json["result"][0]["id"], 42);
+
+    let info_resp = client
+        .get(format!("{base_url}/collections/test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info_resp.status().as_u16(), 200);
+    let info_json: Value = info_resp.json().await.unwrap();
+    assert_eq!(info_json["result"]["license"]["limit_reached"], true);
+    assert_eq!(info_json["result"]["license"]["read_only"], true);
+
+    let health_resp = client
+        .get(format!("{base_url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health_resp.status().as_u16(), 200);
 
     let _ = tx.send(());
     let _ = server_handle.await;
