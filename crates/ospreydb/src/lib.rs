@@ -1,4 +1,4 @@
-//! Commercial extensions for OspreyDB (`osprey-pro`).
+//! Commercial extensions for OspreyDB (`ospreydb`).
 //!
 //! This crate consumes `osprey-core`, `osprey-simd`, and `osprey-storage`
 //! strictly as external dependencies, implementing offline `Ed25519` license

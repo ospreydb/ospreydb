@@ -1,9 +1,9 @@
-//! Error types for `osprey-pro` commercial licensing, WAL, LSM delta buffer,
+//! Error types for `ospreydb` commercial licensing, WAL, LSM delta buffer,
 //! Copy-on-Write compaction, tombstone GC, and S3 CAS manifest coordination.
 
 use thiserror::Error;
 
-/// Unified result type for `osprey-pro` storage and coordination operations.
+/// Unified result type for `ospreydb` storage and coordination operations.
 pub type ProResult<T> = Result<T, ProEngineError>;
 
 /// Errors produced during offline `Ed25519` license parsing and verification.
@@ -106,7 +106,7 @@ pub enum ProLicenseError {
     SystemClockError,
 }
 
-/// Errors produced by `osprey-pro` continuous ingestion, WAL, compaction, and S3 CAS manifest.
+/// Errors produced by `ospreydb` continuous ingestion, WAL, compaction, and S3 CAS manifest.
 #[derive(Debug, Error)]
 pub enum ProEngineError {
     /// Core OspreyDB binary format, math, or SIMD error.
@@ -120,7 +120,7 @@ pub enum ProEngineError {
     /// Community tier hard vector limit reached (5M) — requires a Pro license activation.
     #[error(
         "Community Tier limit ({limit} vectors) reached. Activate a Pro license via \
-         'osprey-pro activate --license <KEY>' — see https://ospreydb.dev/pricing"
+         'osprey activate --license <KEY>' — see https://ospreydb.dev/pricing"
     )]
     CommunityTierLimitReached {
         /// Hard limit (defaults to [`crate::license::COMMUNITY_MAX_VECTORS`]).

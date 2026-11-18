@@ -248,11 +248,16 @@ mod tests {
 
         let docs = [
             "chocolate cake recipe with vanilla frosting",
-            "vector search on S3 slabs using RaBitQ and WaRP coalescing",
+            "vector search on S3 slabs using RaBitQ and DP range coalescing",
             "kubernetes pod autoscaling for stateless web apps",
         ];
         let hits = reranker
-            .rerank_texts("S3 vector search WaRP", &docs, Some(2), Some(&metrics))
+            .rerank_texts(
+                "S3 vector search DP range coalescing",
+                &docs,
+                Some(2),
+                Some(&metrics),
+            )
             .unwrap();
 
         assert_eq!(hits.len(), 2);

@@ -7,7 +7,7 @@ services:
       - path: .env
         required: false
     environment:
-      REPO_URL: ${REPO_URL:-https://github.com/ospreydb/osprey-pro}
+      REPO_URL: ${REPO_URL:-https://github.com/ospreydb/ospreydb}
       ACCESS_TOKEN: ${ACCESS_TOKEN:-}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-}
       RUNNER_NAME: ${RUNNER_NAME:-osprey-pro-local-builder}
@@ -23,7 +23,8 @@ services:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
-      # Optional read-only token for fetching private ospreydb/ospreydb crates (unless set via GitHub Secret OSPREY_CORE_TOKEN)
+      # Optional read-only token for fetching private ospreydb/osprey-engine crates (unless set via GitHub Secret OSPREY_ENGINE_TOKEN / OSPREY_CORE_TOKEN)
+      OSPREY_ENGINE_TOKEN: ${OSPREY_ENGINE_TOKEN:-}
       OSPREY_CORE_TOKEN: ${OSPREY_CORE_TOKEN:-}
     volumes:
       # Docker-out-of-Docker for Buildx multi-arch Distroless image builds

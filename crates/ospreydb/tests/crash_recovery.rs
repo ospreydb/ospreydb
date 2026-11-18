@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use osprey_core::RawVectorRecord;
-use osprey_pro::{LsmDeltaBuffer, OspreyWal, WalConfig, WalRecoveryMode, WalSyncPolicy};
+use ospreydb::{LsmDeltaBuffer, OspreyWal, WalConfig, WalRecoveryMode, WalSyncPolicy};
 
 static CRASH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -28,7 +28,7 @@ fn sigkill_during_intense_wal_writes_recovers_100_percent_committed_state_in_ms(
     let wal_path = temp_wal_path("sigkill");
     let _ = fs::remove_file(&wal_path);
 
-    let bin = env!("CARGO_BIN_EXE_osprey-pro");
+    let bin = env!("CARGO_BIN_EXE_osprey");
     let dim = 64_usize;
     let batch_size = 50_usize;
 
@@ -69,7 +69,7 @@ fn sigkill_during_intense_wal_writes_recovers_100_percent_committed_state_in_ms(
         }
     }
 
-    // Abruptly SIGKILL the osprey-pro process while it continues hammering WAL writes!
+    // Abruptly SIGKILL the osprey process while it continues hammering WAL writes!
     child.kill().unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success());
@@ -209,6 +209,6 @@ fn concurrent_high_load_wal_writes_and_torn_tail_recovery_in_milliseconds() {
     let _ = fs::remove_file(&wal_path);
 }
 
-fn wal_last_seq(records: &[osprey_pro::WalRecord]) -> u64 {
+fn wal_last_seq(records: &[ospreydb::WalRecord]) -> u64 {
     records.last().map_or(0, |r| r.seq_no)
 }

@@ -35,6 +35,6 @@ is available as a separately priced add-on for Enterprise license holders. Conta
 
 - [OspreyDB Pro README](./README.md)
 - [End-User License Agreement (EULA)](./EULA.md)
-- [Core Architecture Reference](https://github.com/ospreydb/ospreydb/blob/main/ARCHITECTURE.md)
+- [Core Architecture Reference](https://github.com/ospreydb/osprey-engine/blob/main/ARCHITECTURE.md)
 - [ospreydb.dev/docs](https://ospreydb.dev/docs)
-- [GitHub Releases](https://github.com/ospreydb/osprey-pro/releases)
+- [GitHub Releases](https://github.com/ospreydb/ospreydb/releases)

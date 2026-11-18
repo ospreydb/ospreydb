@@ -11,7 +11,7 @@ name = "osprey-keygen"
 path = "src/main.rs"
 
 [dependencies]
-osprey-pro = { path = "../osprey-pro" }
+ospreydb = { path = "../ospreydb" }
 base64.workspace = true
 clap.workspace = true
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

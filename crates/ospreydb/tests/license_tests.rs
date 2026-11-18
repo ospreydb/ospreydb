@@ -6,7 +6,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use osprey_core::{LicenseVerifier, ProCapability};
-use osprey_pro::{
+use ospreydb::{
     OfflineLicenseVerifier, OspreyLicense, ProLicenseError, LICENSE_GRACE_PERIOD_SECS,
     LICENSE_TOKEN_PREFIX, MAX_CLOCK_SKEW_SECS, MAX_LICENSE_TOKEN_BYTES,
 };

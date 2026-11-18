@@ -11,7 +11,7 @@ Licensee a **non-exclusive, non-transferable, worldwide annual subscription lice
 run one (1) instance of the OspreyDB Pro binary per licensed node, solely for Licensee's internal
 business operations.
 
-- **Community / Personal Free Tier:** Running `osprey-pro` without a license key activates a
+- **Community / Personal Free Tier:** Running `osprey` without a license key activates a
   `Single-Node Community Tier` with a hard technical cap of **5,000,000 (5M) vectors** and
   local/single-writer storage. The free tier includes the full WAL, LSM Delta Buffer, HTTP API
   (`:6333`), and Auto-Embeddings `/v1/embeddings` at no cost.
@@ -36,7 +36,7 @@ production downtime if payment renewal is delayed, the offline Ed25519 verifier 
 **30-day renewal grace period** past `expires_at` (emitting explicit warning logs). Once the
 30-day grace period elapses without a renewed key, Pro-tier startup is blocked until a valid
 subscription key is activated, while existing on-disk/S3 data remains readable via the open-core
-`osprey` CLI.
+`osprey-engine` CLI.
 
 ## 4. Restrictions
 

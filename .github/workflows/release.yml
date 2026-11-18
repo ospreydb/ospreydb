@@ -1,4 +1,4 @@
-name: OspreyDB Pro CI & Release
+name: OspreyDB CI & Release
 
 on:
   pull_request:
@@ -6,6 +6,7 @@ on:
       - main
   push:
     tags:
+      - 'v*'
       - 'pro-v*'
 
 concurrency:
@@ -37,17 +38,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure Git access for private ospreydb/ospreydb crates
+      - name: Configure Git access for private ospreydb/osprey-engine crates
         env:
-          CORE_TOKEN: ${{ secrets.OSPREY_CORE_TOKEN || env.OSPREY_CORE_TOKEN }}
+          ENGINE_TOKEN: ${{ secrets.OSPREY_ENGINE_TOKEN || secrets.OSPREY_CORE_TOKEN || env.OSPREY_ENGINE_TOKEN || env.OSPREY_CORE_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -n "${CORE_TOKEN:-}" ]; then
+          if [ -n "${ENGINE_TOKEN:-}" ]; then
             git config --global --replace-all \
-              "url.https://x-access-token:${CORE_TOKEN}@github.com/ospreydb/ospreydb.insteadOf" \
-              "https://github.com/ospreydb/ospreydb"
+              "url.https://x-access-token:${ENGINE_TOKEN}@github.com/ospreydb/osprey-engine.insteadOf" \
+              "https://github.com/ospreydb/osprey-engine"
           else
-            echo "::notice::OSPREY_CORE_TOKEN not set; assuming ospreydb/ospreydb is public or pre-cached."
+            echo "::notice::OSPREY_ENGINE_TOKEN / OSPREY_CORE_TOKEN not set; assuming ospreydb/osprey-engine is public or pre-cached."
           fi
 
       - name: Bootstrap persistent Rust toolchain & sccache
@@ -98,12 +99,12 @@ jobs:
       - name: Clean temporary Git credential rewrite
         if: always()
         run: |
-          git config --global --name-only --get-regexp '^url\..*github\.com/ospreydb/ospreydb\.insteadOf$' \
+          git config --global --name-only --get-regexp '^url\..*github\.com/ospreydb/osprey-engine\.insteadOf$' \
             | xargs -r -n1 git config --global --unset-all || true
 
   release:
     name: Multi-Arch Build, Distroless GHCR & Release (${{ github.ref_name }})
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/pro-v')
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/pro-v'))
     runs-on: [self-hosted, osprey-pro-builder]
     defaults:
       run:
@@ -112,17 +113,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure Git access for private ospreydb/ospreydb crates
+      - name: Configure Git access for private ospreydb/osprey-engine crates
         env:
-          CORE_TOKEN: ${{ secrets.OSPREY_CORE_TOKEN || env.OSPREY_CORE_TOKEN }}
+          ENGINE_TOKEN: ${{ secrets.OSPREY_ENGINE_TOKEN || secrets.OSPREY_CORE_TOKEN || env.OSPREY_ENGINE_TOKEN || env.OSPREY_CORE_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -n "${CORE_TOKEN:-}" ]; then
+          if [ -n "${ENGINE_TOKEN:-}" ]; then
             git config --global --replace-all \
-              "url.https://x-access-token:${CORE_TOKEN}@github.com/ospreydb/ospreydb.insteadOf" \
-              "https://github.com/ospreydb/ospreydb"
+              "url.https://x-access-token:${ENGINE_TOKEN}@github.com/ospreydb/osprey-engine.insteadOf" \
+              "https://github.com/ospreydb/osprey-engine"
           else
-            echo "::notice::OSPREY_CORE_TOKEN not set; assuming ospreydb/ospreydb is public or pre-cached."
+            echo "::notice::OSPREY_ENGINE_TOKEN / OSPREY_CORE_TOKEN not set; assuming ospreydb/osprey-engine is public or pre-cached."
           fi
 
       - name: Bootstrap persistent Rust toolchain, sccache, Zig & cargo-zigbuild
@@ -175,15 +176,15 @@ jobs:
 
             echo "=== Building static musl binaries for ${target} ==="
             cargo zigbuild --release --locked --target "${target}" \
-              --bin osprey-pro \
+              --bin osprey \
               --bin osprey-keygen
 
-            # Stage osprey-pro binary for multi-arch Distroless image
-            cp "target/${target}/release/osprey-pro" "dist-docker/${docker_arch}/osprey-pro"
-            chmod 0755 "dist-docker/${docker_arch}/osprey-pro"
+            # Stage osprey binary for multi-arch Distroless image
+            cp "target/${target}/release/osprey" "dist-docker/${docker_arch}/osprey"
+            chmod 0755 "dist-docker/${docker_arch}/osprey"
 
-            # Package release archives for osprey-pro and osprey-keygen
-            for bin in osprey-pro osprey-keygen; do
+            # Package release archives for osprey and osprey-keygen
+            for bin in osprey osprey-keygen; do
               local archive_dir="${bin}-${TAG}-${target}"
               mkdir -p "dist/${archive_dir}"
               cp "target/${target}/release/${bin}" "dist/${archive_dir}/${bin}"
@@ -219,13 +220,13 @@ jobs:
         id: docker_meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/ospreydb/osprey-pro
+          images: ghcr.io/ospreydb/osprey
           tags: |
-            type=match,pattern=pro-v(.*),group=1
-            type=match,pattern=pro-v(\d+\.\d+)\.\d+,group=1
+            type=match,pattern=^(?:pro-)?v(.*),group=1
+            type=match,pattern=^(?:pro-)?v(\d+\.\d+)\.\d+,group=1
             type=raw,value=latest
 
-      - name: Build and push multi-arch Distroless image (ghcr.io/ospreydb/osprey-pro)
+      - name: Build and push multi-arch Distroless image (ghcr.io/ospreydb/osprey)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -281,11 +282,11 @@ jobs:
         if: always()
         run: rm -rf dist-docker
 
-      - name: Publish private GitHub Release with binaries and SHA256SUMS
+      - name: Publish GitHub Release with binaries and SHA256SUMS
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: OspreyDB Pro ${{ github.ref_name }}
+          name: OspreyDB ${{ github.ref_name }}
           generate_release_notes: true
           files: |
             dist/*.tar.gz
@@ -299,5 +300,5 @@ jobs:
       - name: Clean temporary Git credential rewrite
         if: always()
         run: |
-          git config --global --name-only --get-regexp '^url\..*github\.com/ospreydb/ospreydb\.insteadOf$' \
+          git config --global --name-only --get-regexp '^url\..*github\.com/ospreydb/osprey-engine\.insteadOf$' \
             | xargs -r -n1 git config --global --unset-all || true

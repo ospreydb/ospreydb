@@ -1812,7 +1812,7 @@ dependencies = [
 [[package]]
 name = "osprey-core"
 version = "0.1.0"
-source = "git+https://github.com/ospreydb/ospreydb.git?branch=main#72a9311c1646becc15ea0a16be2f200498f58f9f"
+source = "git+https://github.com/ospreydb/osprey-engine.git?branch=main#03e0b4e34d80a83a35edb351e3de383e69d848ac"
 dependencies = [
  "bytemuck",
  "half",
@@ -1830,14 +1830,47 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ed25519-dalek",
- "osprey-pro",
+ "ospreydb",
  "rand 0.8.8",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "osprey-pro"
+name = "osprey-simd"
+version = "0.1.0"
+source = "git+https://github.com/ospreydb/osprey-engine.git?branch=main#03e0b4e34d80a83a35edb351e3de383e69d848ac"
+dependencies = [
+ "osprey-core",
+]
+
+[[package]]
+name = "osprey-storage"
+version = "0.1.0"
+source = "git+https://github.com/ospreydb/osprey-engine.git?branch=main#03e0b4e34d80a83a35edb351e3de383e69d848ac"
+dependencies = [
+ "arrow",
+ "bytemuck",
+ "bytes",
+ "futures",
+ "half",
+ "memmap2",
+ "object_store",
+ "osprey-core",
+ "osprey-simd",
+ "parquet",
+ "rayon",
+ "roaring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "xxhash-rust",
+ "zstd",
+]
+
+[[package]]
+name = "ospreydb"
 version = "0.1.0"
 dependencies = [
  "arrow",
@@ -1868,39 +1901,6 @@ dependencies = [
  "tonic",
  "tracing",
  "xxhash-rust",
-]
-
-[[package]]
-name = "osprey-simd"
-version = "0.1.0"
-source = "git+https://github.com/ospreydb/ospreydb.git?branch=main#72a9311c1646becc15ea0a16be2f200498f58f9f"
-dependencies = [
- "osprey-core",
-]
-
-[[package]]
-name = "osprey-storage"
-version = "0.1.0"
-source = "git+https://github.com/ospreydb/ospreydb.git?branch=main#72a9311c1646becc15ea0a16be2f200498f58f9f"
-dependencies = [
- "arrow",
- "bytemuck",
- "bytes",
- "futures",
- "half",
- "memmap2",
- "object_store",
- "osprey-core",
- "osprey-simd",
- "parquet",
- "rayon",
- "roaring",
- "serde",
- "serde_json",
- "tokio",
- "url",
- "xxhash-rust",
- "zstd",
 ]
 
 [[package]]
@@ -2098,7 +2098,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -2136,7 +2136,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

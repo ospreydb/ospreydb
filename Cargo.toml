@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/osprey-pro",
+    "crates/ospreydb",
     "crates/osprey-keygen",
 ]
 
@@ -9,12 +9,12 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "LicenseRef-OspreyDB-Commercial"
-repository = "https://github.com/ospreydb/osprey-pro"
+repository = "https://github.com/ospreydb/ospreydb"
 
 [workspace.dependencies]
-osprey-core = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.0" }
-osprey-simd = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.0" }
-osprey-storage = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.0" }
+osprey-core = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main", version = "0.1.0" }
+osprey-simd = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main", version = "0.1.0" }
+osprey-storage = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main", version = "0.1.0" }
 
 arrow = "53"
 arrow-flight = "53.4"

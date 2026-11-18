@@ -7,7 +7,7 @@ ENV_FILE="${SCRIPT_DIR}/.env"
 ENV_EXAMPLE="${SCRIPT_DIR}/.env.example"
 DOCKER_SOCK="/var/run/docker.sock"
 
-echo "=== OspreyDB Pro — Self-Hosted GitHub Actions Runner Setup ==="
+echo "=== OspreyDB — Self-Hosted GitHub Actions Runner Setup ==="
 
 # 1. Check Docker & Docker Compose
 if ! command -v docker >/dev/null 2>&1; then
@@ -99,7 +99,7 @@ if [ -z "${ACCESS_TOKEN_VAL}" ] && [ -z "${RUNNER_TOKEN_VAL}" ]; then
 fi
 
 # 5. Start runner stack in background
-echo "=== Starting osprey-pro self-hosted runner ==="
+echo "=== Starting osprey self-hosted runner ==="
 DOCKER_GID="${DOCKER_GID}" docker compose -f "${COMPOSE_FILE}" up -d
 
 echo ""

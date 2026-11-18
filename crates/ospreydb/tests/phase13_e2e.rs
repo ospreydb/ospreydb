@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
-use osprey_pro::{
+use osprey_storage::{
+    MinipageLruCache, RangePlannerConfig, RemoteStoreConfig, DEFAULT_MINIPAGE_CACHE_BYTES,
+};
+use ospreydb::{
     build_http_router, ClusterManifest, Embedder, EmbedderConfig, HttpServerState,
     HybridSearchEngine, LsmDeltaBuffer, LutRankReranker, ManifestStore, OfflineLicenseVerifier,
     OspreyLicense, ProMetricsRegistry, COMMUNITY_MAX_VECTORS, DEFAULT_LUTRANK_SEED,
     DEFAULT_MANIFEST_KEY,
-};
-use osprey_storage::{
-    MinipageLruCache, RemoteStoreConfig, WarpConfig, DEFAULT_MINIPAGE_CACHE_BYTES,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -49,7 +49,7 @@ async fn community_tier_limit_returns_402_payment_required() {
         manifest_store,
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
         Arc::clone(&metrics),
     ));
 
@@ -61,7 +61,7 @@ async fn community_tier_limit_returns_402_payment_required() {
     // Exhaust the community tier limit (simulate 5M vectors already stored)
     let seed_vec = basis_vec(dim, 0);
     delta
-        .ingest_batch(&[osprey_pro::RawVectorRecord {
+        .ingest_batch(&[ospreydb::RawVectorRecord {
             doc_id: 42,
             vector: &seed_vec,
             payload_json: br#"{"title":"existing-doc"}"#,
@@ -170,7 +170,7 @@ async fn enterprise_license_unlocks_unlimited_vectors() {
         manifest_store,
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
         Arc::clone(&metrics),
     ));
 
@@ -251,7 +251,7 @@ async fn text_based_upsert_with_explicit_vector_delegates_to_direct_ingest() {
         manifest_store,
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
         Arc::clone(&metrics),
     ));
 
@@ -354,7 +354,7 @@ fn license_with_max_vectors_retains_field_after_round_trip() {
     use base64::Engine as _;
     use ed25519_dalek::Signer as _;
     use ed25519_dalek::SigningKey;
-    use osprey_pro::LICENSE_TOKEN_PREFIX;
+    use ospreydb::LICENSE_TOKEN_PREFIX;
     use rand::rngs::OsRng;
 
     let key = SigningKey::generate(&mut OsRng);
@@ -420,7 +420,7 @@ async fn manifest_cas_etag_conflict_retry_preserves_all_writer_segments() {
             ms.update_with_cas_retry(64, |m| {
                 let id = m.allocate_segment_id();
                 m.segments.push(
-                    osprey_pro::SegmentDescriptor::new(
+                    ospreydb::SegmentDescriptor::new(
                         id,
                         format!("w{worker_id}/seg-{id}.osi"),
                         format!("w{worker_id}/seg-{id}.osv"),
@@ -468,7 +468,7 @@ async fn collection_info_exposes_license_and_embedder_metadata() {
         manifest_store,
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
         Arc::clone(&metrics),
     ));
 

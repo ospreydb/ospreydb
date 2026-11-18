@@ -135,7 +135,7 @@ where
 }
 
 async fn handle_healthz() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "engine": "osprey-pro" }))
+    Json(json!({ "status": "ok", "engine": "osprey" }))
 }
 
 async fn handle_metrics(State(state): State<HttpServerState>) -> Response {

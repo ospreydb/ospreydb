@@ -1,5 +1,5 @@
 //! Prometheus observability registry exporting P50/P95/P99 latency histograms for
-//! Stage-1 RaBitQ scan, Stage-2 WaRP DP solver, S3 calls saved, and Stage-4 `LUT-Rank` throughput.
+//! Stage-1 RaBitQ scan, Stage-2 DP range planner, S3 calls saved, and Stage-4 `LUT-Rank` throughput.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -142,11 +142,11 @@ pub struct MetricsSnapshot {
     pub rabitq_scan_count: u64,
     /// RaBitQ scan P50/P95/P99 latency in microseconds.
     pub rabitq_p50_p95_p99_us: (f64, f64, f64),
-    /// Total WaRP DP plans recorded.
-    pub warp_solver_count: u64,
-    /// WaRP solver P50/P95/P99 latency in microseconds.
-    pub warp_p50_p95_p99_us: (f64, f64, f64),
-    /// Total S3 `Range-GET` round trips avoided via WaRP coalescing and LRU cache hits.
+    /// Total DP range plans recorded.
+    pub range_planner_count: u64,
+    /// Range planner P50/P95/P99 latency in microseconds.
+    pub range_planner_p50_p95_p99_us: (f64, f64, f64),
+    /// Total S3 `Range-GET` round trips avoided via DP range coalescing and LRU cache hits.
     pub s3_calls_saved_total: u64,
     /// Total raw `.osv` minipage requests before coalescing/caching.
     pub s3_raw_page_requests_total: u64,
@@ -162,11 +162,11 @@ pub struct MetricsSnapshot {
     pub lutrank_p50_p95_p99_us: (f64, f64, f64),
 }
 
-/// Lock-free Prometheus metrics collector for `osprey-pro` servers and query pipelines.
+/// Lock-free Prometheus metrics collector for `osprey` servers and query pipelines.
 #[derive(Debug)]
 pub struct ProMetricsRegistry {
     rabitq_scan_us: LatencyHistogram,
-    warp_solver_us: LatencyHistogram,
+    range_planner_us: LatencyHistogram,
     lutrank_us: LatencyHistogram,
     s3_raw_page_requests: AtomicU64,
     s3_coalesced_range_gets: AtomicU64,
@@ -193,7 +193,7 @@ impl ProMetricsRegistry {
     pub fn new() -> Self {
         Self {
             rabitq_scan_us: LatencyHistogram::new(),
-            warp_solver_us: LatencyHistogram::new(),
+            range_planner_us: LatencyHistogram::new(),
             lutrank_us: LatencyHistogram::new(),
             s3_raw_page_requests: AtomicU64::new(0),
             s3_coalesced_range_gets: AtomicU64::new(0),
@@ -214,15 +214,15 @@ impl ProMetricsRegistry {
         self.rabitq_scan_us.observe(latency_us);
     }
 
-    /// Records Stage-2 WaRP DP planning latency and S3 request savings.
-    pub fn observe_warp_and_s3(
+    /// Records Stage-2 DP range planning latency and S3 request savings.
+    pub fn observe_range_plan_and_s3(
         &self,
-        warp_plan_time_us: u64,
+        range_plan_time_us: u64,
         raw_page_requests: usize,
         coalesced_range_gets: usize,
         cache_hits: usize,
     ) {
-        self.warp_solver_us.observe(warp_plan_time_us);
+        self.range_planner_us.observe(range_plan_time_us);
         let raw_u64 = u64::try_from(raw_page_requests).unwrap_or(u64::MAX);
         let coalesced_u64 = u64::try_from(coalesced_range_gets).unwrap_or(u64::MAX);
         let hits_u64 = u64::try_from(cache_hits).unwrap_or(u64::MAX);
@@ -284,8 +284,8 @@ impl ProMetricsRegistry {
         MetricsSnapshot {
             rabitq_scan_count: self.rabitq_scan_us.count.load(Ordering::Relaxed),
             rabitq_p50_p95_p99_us: self.rabitq_scan_us.quantiles(),
-            warp_solver_count: self.warp_solver_us.count.load(Ordering::Relaxed),
-            warp_p50_p95_p99_us: self.warp_solver_us.quantiles(),
+            range_planner_count: self.range_planner_us.count.load(Ordering::Relaxed),
+            range_planner_p50_p95_p99_us: self.range_planner_us.quantiles(),
             s3_calls_saved_total: self.s3_calls_saved.load(Ordering::Relaxed),
             s3_raw_page_requests_total: self.s3_raw_page_requests.load(Ordering::Relaxed),
             s3_coalesced_range_gets_total: self.s3_coalesced_range_gets.load(Ordering::Relaxed),
@@ -306,10 +306,10 @@ impl ProMetricsRegistry {
             "osprey_pro_rabitq_scan_duration_microseconds",
             "Stage-1 1-bit RaBitQ scan latency in microseconds",
         );
-        self.warp_solver_us.write_prometheus(
+        self.range_planner_us.write_prometheus(
             &mut out,
-            "osprey_pro_warp_solver_duration_microseconds",
-            "Stage-2 WaRP dynamic programming coalescing solver latency in microseconds",
+            "osprey_pro_range_planner_duration_microseconds",
+            "Stage-2 DP range coalescing planner latency in microseconds",
         );
         self.lutrank_us.write_prometheus(
             &mut out,
@@ -320,7 +320,7 @@ impl ProMetricsRegistry {
         let snap = self.snapshot();
         let _ = writeln!(
             out,
-            "# HELP osprey_pro_s3_calls_saved_total Total S3 Range-GET calls saved by WaRP coalescing and LRU cache"
+            "# HELP osprey_pro_s3_calls_saved_total Total S3 Range-GET calls saved by DP range coalescing and LRU cache"
         );
         let _ = writeln!(out, "# TYPE osprey_pro_s3_calls_saved_total counter");
         let _ = writeln!(
@@ -331,7 +331,7 @@ impl ProMetricsRegistry {
 
         let _ = writeln!(
             out,
-            "# HELP osprey_pro_s3_raw_page_requests_total Total minipage requests before WaRP coalescing"
+            "# HELP osprey_pro_s3_raw_page_requests_total Total minipage requests before DP range coalescing"
         );
         let _ = writeln!(out, "# TYPE osprey_pro_s3_raw_page_requests_total counter");
         let _ = writeln!(
@@ -460,7 +460,7 @@ mod tests {
         for us in [20, 40, 60, 120, 450, 900] {
             reg.observe_rabitq_scan(us);
         }
-        reg.observe_warp_and_s3(180, 16, 3, 5);
+        reg.observe_range_plan_and_s3(180, 16, 3, 5);
         reg.observe_lutrank(32, 4096, 500);
 
         let text = reg.render_prometheus();
@@ -468,7 +468,7 @@ mod tests {
         assert!(text.contains("osprey_pro_rabitq_scan_duration_microseconds_p50_microseconds"));
         assert!(text.contains("osprey_pro_rabitq_scan_duration_microseconds_p95_microseconds"));
         assert!(text.contains("osprey_pro_rabitq_scan_duration_microseconds_p99_microseconds"));
-        assert!(text.contains("osprey_pro_warp_solver_duration_microseconds_count 1"));
+        assert!(text.contains("osprey_pro_range_planner_duration_microseconds_count 1"));
         assert!(text.contains("osprey_pro_s3_calls_saved_total 13"));
         assert!(text.contains("osprey_pro_lutrank_tokens_total 4096"));
         assert!(text.contains("osprey_pro_lutrank_tokens_per_sec"));

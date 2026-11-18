@@ -14,7 +14,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::{Signer as _, SigningKey};
-use osprey_pro::{
+use ospreydb::{
     OfflineLicenseVerifier, OspreyLicense, ProLicenseError, COMMUNITY_MAX_VECTORS,
     LICENSE_TOKEN_PREFIX,
 };

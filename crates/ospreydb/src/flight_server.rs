@@ -38,7 +38,7 @@ pub const DEFAULT_ARROW_FLIGHT_ADDR: &str = "0.0.0.0:8815";
 
 type TonicStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-/// `osprey-pro` Apache Arrow Flight gRPC service backed by [`HybridSearchEngine`] and [`LutRankReranker`].
+/// `osprey` Apache Arrow Flight gRPC service backed by [`HybridSearchEngine`] and [`LutRankReranker`].
 #[derive(Clone, Debug)]
 pub struct OspreyFlightService {
     engine: Arc<HybridSearchEngine>,

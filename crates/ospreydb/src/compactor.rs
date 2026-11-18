@@ -11,7 +11,8 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use osprey_core::math::padded_dimension;
 use osprey_core::{
-    fit_superkmeans, AlignedBuffer, CompactionReport, OsiIndex, SuperKMeansConfig, VectorLocation,
+    fit_binary_kmeans, AlignedBuffer, BinaryKMeansConfig, CompactionReport, OsiIndex,
+    VectorLocation,
 };
 use osprey_simd::SimdEngine;
 use osprey_storage::{
@@ -627,8 +628,8 @@ fn build_segment_artifacts(
     let padded_dim = padded_dimension(orig_dim)?;
     let num_clusters = target_clusters.max(1).min(n);
 
-    let kmeans_cfg = SuperKMeansConfig::new(num_clusters);
-    let mut kmeans = fit_superkmeans(
+    let kmeans_cfg = BinaryKMeansConfig::new(num_clusters);
+    let mut kmeans = fit_binary_kmeans(
         &snapshot.vectors_f32,
         n,
         orig_dim,
@@ -675,7 +676,7 @@ fn build_segment_artifacts(
         });
     }
 
-    // Align SuperKMeans centroids and assignments with TSP physical order for `.osi`.
+    // Align Binary K-Means centroids and assignments with TSP physical order for `.osi`.
     kmeans.centroids_f16 = reordered_centroids;
     kmeans.assignments = physical_assignments;
 

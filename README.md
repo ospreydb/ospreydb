@@ -1,6 +1,6 @@
-# OspreyDB Pro (`ospreydb/osprey-pro`)
+# OspreyDB (`ospreydb/ospreydb`)
 
-Commercial production daemon and offline Ed25519 licensing engine for **OspreyDB**, consuming `osprey-core`, `osprey-simd`, and `osprey-storage` from `ospreydb/ospreydb` without modifying the Apache-2.0 open-core repository.
+Production vector database server and commercial offline Ed25519 licensing engine for **OspreyDB**, consuming `osprey-core`, `osprey-simd`, and `osprey-storage` from `ospreydb/osprey-engine` without modifying the Apache-2.0 open-core repository.
 
 ## Capabilities
 
@@ -19,18 +19,18 @@ Commercial production daemon and offline Ed25519 licensing engine for **OspreyDB
 
 ```bash
 # Optional: persist a Pro license key to ~/.osprey/license.key (mode 0600)
-osprey-pro activate --license "OSPREY-PRO-v1...."
+osprey activate --license "OSPREY-PRO-v1...."
 
 # Start the daemon (reads ~/.osprey/license.key, --license, or OSPREY_PRO_LICENSE)
-osprey-pro serve \
+osprey serve \
   --dim 128 \
-  --wal-path ./osprey-pro.wal \
+  --wal-path ./osprey.wal \
   --s3-manifest s3://your-bucket/osprey/manifest.json
 ```
 
 ## Self-Hosted CI/CD & Multi-Arch Releases
 
 - Runner stack: [`infra/ci/docker-compose.runner.yml`](./infra/ci/docker-compose.runner.yml) + [`infra/ci/setup-runner.sh`](./infra/ci/setup-runner.sh)
-- Workflow: [`.github/workflows/pro-release.yml`](./.github/workflows/pro-release.yml) (runs PR checks on `main` and builds Linux `x86_64`/`aarch64` `musl` binaries + Distroless `ghcr.io/ospreydb/osprey-pro` image on `pro-v*` tags).
+- Workflow: [`.github/workflows/release.yml`](./.github/workflows/release.yml) (runs PR checks on `main` and builds Linux `x86_64`/`aarch64` `musl` binaries + Distroless `ghcr.io/ospreydb/osprey` image on `v*` and `pro-v*` tags).
 
 See [`EULA.md`](./EULA.md) and [`SUPPORT.md`](./SUPPORT.md) for commercial terms and support SLAs.

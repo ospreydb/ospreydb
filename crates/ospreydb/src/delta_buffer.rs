@@ -17,8 +17,8 @@ use osprey_core::{
 };
 use osprey_simd::{SimdBackend, SimdEngine};
 use osprey_storage::{
-    CandidatePageRef, MinipageLruCache, RefineStage, RefinedSearchResult, RemoteStoreConfig,
-    WarpConfig,
+    CandidatePageRef, MinipageLruCache, RangePlannerConfig, RefineStage, RefinedSearchResult,
+    RemoteStoreConfig,
 };
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -74,7 +74,7 @@ pub struct FrozenDeltaSnapshot {
 ///
 /// New vectors are rotated via FWHT, assigned to the nearest existing `.osi` `f16` centroid,
 /// and quantized into 1-bit `RaBitQ` codes + exact `f16` vectors so they become searchable
-/// in `< 1 ms` without retraining `1-Bit SuperKMeans`.
+/// in `< 1 ms` without retraining `1-Bit Binary K-Means`.
 pub struct LsmDeltaBuffer {
     orig_dim: usize,
     padded_dim: usize,
@@ -711,7 +711,7 @@ pub struct LoadedSegment {
     pub osi: Arc<OsiIndex>,
     /// `.osv` minipage directory entries.
     pub osv_directory: Vec<MinipageDirectoryEntry>,
-    /// `RefineStage` configured with `slab_id`, `WarpConfig`, and optional Zstd dict.
+    /// `RefineStage` configured with `slab_id`, `RangePlannerConfig`, and optional Zstd dict.
     pub refine_stage: RefineStage,
     /// Segment-local tombstones from `manifest.json`.
     pub tombstones: RoaringBitmap,
@@ -726,7 +726,7 @@ pub struct HybridSearchEngine {
     manifest_store: ManifestStore,
     cache: Arc<MinipageLruCache>,
     remote_config: RemoteStoreConfig,
-    warp_config: WarpConfig,
+    range_planner_config: RangePlannerConfig,
     simd: SimdEngine,
     segments: RwLock<Vec<Arc<LoadedSegment>>>,
     global_tombstones: RwLock<RoaringBitmap>,
@@ -743,7 +743,7 @@ impl HybridSearchEngine {
         manifest_store: ManifestStore,
         cache: Arc<MinipageLruCache>,
         remote_config: RemoteStoreConfig,
-        warp_config: WarpConfig,
+        range_planner_config: RangePlannerConfig,
     ) -> Self {
         Self::with_metrics(
             delta,
@@ -751,7 +751,7 @@ impl HybridSearchEngine {
             manifest_store,
             cache,
             remote_config,
-            warp_config,
+            range_planner_config,
             Arc::new(ProMetricsRegistry::new()),
         )
     }
@@ -764,7 +764,7 @@ impl HybridSearchEngine {
         manifest_store: ManifestStore,
         cache: Arc<MinipageLruCache>,
         remote_config: RemoteStoreConfig,
-        warp_config: WarpConfig,
+        range_planner_config: RangePlannerConfig,
         metrics: Arc<ProMetricsRegistry>,
     ) -> Self {
         Self {
@@ -773,7 +773,7 @@ impl HybridSearchEngine {
             manifest_store,
             cache,
             remote_config,
-            warp_config,
+            range_planner_config,
             simd: SimdEngine::new_auto(),
             segments: RwLock::new(Vec::new()),
             global_tombstones: RwLock::new(RoaringBitmap::new()),
@@ -959,7 +959,7 @@ impl HybridSearchEngine {
 
         #[allow(clippy::cast_possible_truncation)]
         let slab_id = (desc.segment_id & 0xFFFF) as u16;
-        let refine_stage = RefineStage::new(slab_id, self.warp_config, zstd_dict);
+        let refine_stage = RefineStage::new(slab_id, self.range_planner_config, zstd_dict);
 
         Ok(LoadedSegment {
             segment_id: desc.segment_id,
@@ -1065,8 +1065,8 @@ impl HybridSearchEngine {
                         &remote_cfg,
                     )
                     .await?;
-                metrics.observe_warp_and_s3(
-                    stats.warp_plan_time_us,
+                metrics.observe_range_plan_and_s3(
+                    stats.range_plan_time_us,
                     stats.raw_page_requests,
                     stats.coalesced_range_gets,
                     stats.cache_hits,

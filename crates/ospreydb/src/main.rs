@@ -1,4 +1,4 @@
-//! `osprey-pro` production daemon hosting Apache Arrow Flight (`:8815`),
+//! `osprey` production daemon hosting Apache Arrow Flight (`:8815`),
 //! Drop-In Qdrant/Cohere HTTP & Prometheus `/metrics` (`:6333`), built-in
 //! `/v1/embeddings` (OpenAI-compatible), offline Ed25519 license verification,
 //! WAL/LSM Delta Buffer, and CoW Compactor.
@@ -16,23 +16,23 @@ use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use osprey_core::math::padded_dimension;
 use osprey_core::{ProCapability, RawVectorRecord};
-use osprey_pro::{
+use osprey_storage::{
+    build_object_store, MinipageLruCache, RangePlannerConfig, RemoteStoreConfig,
+    DEFAULT_MINIPAGE_CACHE_BYTES,
+};
+use ospreydb::{
     current_unix_secs, serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder,
     EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
     ManifestStore, OfflineLicenseVerifier, OspreyFlightService, OspreyWal, ProEngineError,
     ProMetricsRegistry, ProResult, VectorQuotaState, WalConfig, WalRecoveryMode, WalSyncPolicy,
     DEFAULT_ARROW_FLIGHT_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
 };
-use osprey_storage::{
-    build_object_store, MinipageLruCache, RemoteStoreConfig, WarpConfig,
-    DEFAULT_MINIPAGE_CACHE_BYTES,
-};
 use tokio::sync::Notify;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "osprey-pro",
-    about = "OspreyDB Commercial Engine (Arrow Flight, Qdrant/Cohere Drop-In, Auto-Embeddings, WAL/LSM & S3 CAS)",
+    name = "osprey",
+    about = "OspreyDB Vector Database Server (Arrow Flight, Qdrant/Cohere Drop-In, Auto-Embeddings, WAL/LSM & S3 CAS)",
     version
 )]
 struct Cli {
@@ -73,7 +73,7 @@ struct ServeArgs {
     #[arg(long, default_value_t = 0x4F53_5052_0001)]
     fwht_seed: u64,
 
-    #[arg(long, default_value = "./osprey-pro.wal")]
+    #[arg(long, default_value = "./osprey.wal")]
     wal_path: PathBuf,
 
     #[arg(long, alias = "s3-manifest", env = "OSPREY_OBJECT_STORE_URI")]
@@ -85,7 +85,7 @@ struct ServeArgs {
     #[arg(long, default_value = DEFAULT_HTTP_ADDR)]
     http_addr: SocketAddr,
 
-    #[arg(long, default_value_t = osprey_pro::DEFAULT_DELTA_FLUSH_THRESHOLD)]
+    #[arg(long, default_value_t = ospreydb::DEFAULT_DELTA_FLUSH_THRESHOLD)]
     delta_flush_threshold: usize,
 
     // -- Embedder configuration (OpenAI-compatible /v1/embeddings) --
@@ -230,7 +230,7 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         Some(lic)
     } else {
         tracing::info!(
-            max_vectors = osprey_pro::COMMUNITY_MAX_VECTORS,
+            max_vectors = ospreydb::COMMUNITY_MAX_VECTORS,
             "Single-Node Community Tier — no license key supplied (5M vector limit, local storage)"
         );
         None
@@ -290,7 +290,7 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         manifest_store.clone(),
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
         Arc::clone(&metrics),
     ));
     let _ = engine.refresh_from_manifest().await?;
@@ -312,10 +312,10 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
     let quota = VectorQuotaState::with_initial_vectors(initial_vectors);
     if let Some(lic) = active_license {
         quota.activate_license(lic);
-    } else if initial_vectors >= osprey_pro::COMMUNITY_MAX_VECTORS {
+    } else if initial_vectors >= ospreydb::COMMUNITY_MAX_VECTORS {
         tracing::warn!(
             total_vectors = initial_vectors,
-            max_vectors = osprey_pro::COMMUNITY_MAX_VECTORS,
+            max_vectors = ospreydb::COMMUNITY_MAX_VECTORS,
             "Community Tier 5M vector limit reached; node remains online in read/search-only mode for vectors"
         );
     }
@@ -435,7 +435,7 @@ async fn main() -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("osprey-pro error: {err}");
+            eprintln!("osprey error: {err}");
             ExitCode::FAILURE
         }
     }

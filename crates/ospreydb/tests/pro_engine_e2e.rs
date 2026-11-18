@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use osprey_core::{RawVectorRecord, StorageEngineExt};
-use osprey_pro::{
+use osprey_storage::{
+    MinipageLruCache, OsvWriterConfig, RangePlannerConfig, RemoteStoreConfig,
+    DEFAULT_MINIPAGE_CACHE_BYTES,
+};
+use ospreydb::{
     ClusterManifest, CompactorConfig, CowSlabCompactor, HybridSearchEngine, LsmDeltaBuffer,
     ManifestStore, OspreyWal, TombstoneGarbageCollector, TombstoneGcConfig, WalConfig,
     DEFAULT_DELTA_FLUSH_THRESHOLD, DEFAULT_MANIFEST_KEY, DEFAULT_TOMBSTONE_GC_THRESHOLD,
-};
-use osprey_storage::{
-    MinipageLruCache, OsvWriterConfig, RemoteStoreConfig, WarpConfig, DEFAULT_MINIPAGE_CACHE_BYTES,
 };
 
 static E2E_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -122,7 +123,7 @@ async fn cow_compactor_stateless_discovery_and_hybrid_search_e2e() {
         })
         .collect();
     // Exercise StorageEngineExt trait directly as well
-    let ext: &dyn StorageEngineExt<Error = osprey_pro::ProEngineError> = &*writer_delta;
+    let ext: &dyn StorageEngineExt<Error = ospreydb::ProEngineError> = &*writer_delta;
     let _seq = ext.append_batch(&raw_batch).unwrap();
     assert_eq!(writer_delta.live_count().unwrap(), 200);
 
@@ -160,7 +161,7 @@ async fn cow_compactor_stateless_discovery_and_hybrid_search_e2e() {
         manifest_store.clone(),
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
     );
     let reader_b = HybridSearchEngine::new(
         Arc::new(LsmDeltaBuffer::new(dim, dim, 1234, Vec::new(), None).unwrap()),
@@ -168,7 +169,7 @@ async fn cow_compactor_stateless_discovery_and_hybrid_search_e2e() {
         manifest_store.clone(),
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
     );
 
     assert!(reader_a.refresh_from_manifest().await.unwrap());
@@ -341,7 +342,7 @@ async fn background_compactor_and_tombstone_gc_rewrite_slabs_above_20_percent() 
         manifest_store,
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
     );
     assert!(reader.refresh_from_manifest().await.unwrap());
     let hits = reader

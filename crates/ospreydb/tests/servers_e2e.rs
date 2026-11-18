@@ -15,14 +15,15 @@ use futures::stream::{self, TryStreamExt};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use osprey_core::RawVectorRecord;
-use osprey_pro::{
+use osprey_storage::{
+    MinipageLruCache, OsvWriterConfig, RangePlannerConfig, RemoteStoreConfig,
+    DEFAULT_MINIPAGE_CACHE_BYTES,
+};
+use ospreydb::{
     build_http_router, ClusterManifest, CompactorConfig, CowSlabCompactor, Embedder,
     EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
     ManifestStore, OspreyFlightService, ProMetricsRegistry, VectorQuotaState,
     COMMUNITY_MAX_VECTORS, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
-};
-use osprey_storage::{
-    MinipageLruCache, OsvWriterConfig, RemoteStoreConfig, WarpConfig, DEFAULT_MINIPAGE_CACHE_BYTES,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -58,7 +59,7 @@ async fn arrow_flight_do_put_do_exchange_and_do_get_e2e() {
         manifest_store.clone(),
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
         Arc::clone(&metrics),
     ));
 
@@ -312,11 +313,11 @@ async fn dropin_cohere_rerank_qdrant_search_and_prometheus_metrics_e2e() {
         manifest_store.clone(),
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
         Arc::clone(&metrics),
     ));
 
-    // Populate base segment so search triggers WaRP + S3 stats in Prometheus metrics
+    // Populate base segment so search triggers range planner + S3 stats in Prometheus metrics
     let vecs: Vec<Vec<f32>> = (0..40).map(|i| basis_vec(dim, i)).collect();
     let payloads: Vec<Vec<u8>> = (0..40)
         .map(|i| format!(r#"{{"title":"doc_{i}"}}"#).into_bytes())
@@ -382,7 +383,7 @@ async fn dropin_cohere_rerank_qdrant_search_and_prometheus_metrics_e2e() {
             "query": "S3 RaBitQ vector search",
             "documents": [
                 "italian pasta cooking guide",
-                { "text": "S3 RaBitQ vector search with WaRP coalescing" },
+                { "text": "S3 RaBitQ vector search with DP range coalescing" },
                 "bicycle repair manual"
             ],
             "top_n": 2,
@@ -448,7 +449,7 @@ async fn dropin_cohere_rerank_qdrant_search_and_prometheus_metrics_e2e() {
     assert!(prom_text.contains("osprey_pro_rabitq_scan_duration_microseconds_p50_microseconds"));
     assert!(prom_text.contains("osprey_pro_rabitq_scan_duration_microseconds_p95_microseconds"));
     assert!(prom_text.contains("osprey_pro_rabitq_scan_duration_microseconds_p99_microseconds"));
-    assert!(prom_text.contains("osprey_pro_warp_solver_duration_microseconds_count"));
+    assert!(prom_text.contains("osprey_pro_range_planner_duration_microseconds_count"));
     assert!(prom_text.contains("osprey_pro_s3_calls_saved_total"));
     assert!(prom_text.contains("osprey_pro_lutrank_tokens_per_sec"));
 
@@ -482,7 +483,7 @@ async fn arrow_flight_blocks_do_put_at_community_limit_while_reads_keep_working(
         manifest_store,
         Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
         RemoteStoreConfig::default(),
-        WarpConfig::default(),
+        RangePlannerConfig::default(),
     ));
     let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED).unwrap());
     let quota = VectorQuotaState::with_initial_vectors(COMMUNITY_MAX_VECTORS);
