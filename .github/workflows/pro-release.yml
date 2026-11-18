@@ -23,6 +23,7 @@ env:
   SCCACHE_DIR: /sccache
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   pr-check:
@@ -35,6 +36,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Configure Git access for private ospreydb/ospreydb crates
+        env:
+          CORE_TOKEN: ${{ secrets.OSPREY_CORE_TOKEN || env.OSPREY_CORE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CORE_TOKEN:-}" ]; then
+            git config --global --replace-all \
+              "url.https://x-access-token:${CORE_TOKEN}@github.com/ospreydb/ospreydb.insteadOf" \
+              "https://github.com/ospreydb/ospreydb"
+          else
+            echo "::notice::OSPREY_CORE_TOKEN not set; assuming ospreydb/ospreydb is public or pre-cached."
+          fi
 
       - name: Bootstrap persistent Rust toolchain & sccache
         run: |
@@ -76,6 +90,12 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
+      - name: Clean temporary Git credential rewrite
+        if: always()
+        run: |
+          git config --global --name-only --get-regexp '^url\..*github\.com/ospreydb/ospreydb\.insteadOf$' \
+            | xargs -r -n1 git config --global --unset-all || true
+
   release:
     name: Multi-Arch Build, Distroless GHCR & Release (${{ github.ref_name }})
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/pro-v')
@@ -86,6 +106,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Configure Git access for private ospreydb/ospreydb crates
+        env:
+          CORE_TOKEN: ${{ secrets.OSPREY_CORE_TOKEN || env.OSPREY_CORE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CORE_TOKEN:-}" ]; then
+            git config --global --replace-all \
+              "url.https://x-access-token:${CORE_TOKEN}@github.com/ospreydb/ospreydb.insteadOf" \
+              "https://github.com/ospreydb/ospreydb"
+          else
+            echo "::notice::OSPREY_CORE_TOKEN not set; assuming ospreydb/ospreydb is public or pre-cached."
+          fi
 
       - name: Bootstrap persistent Rust toolchain, sccache, Zig & cargo-zigbuild
         run: |
@@ -257,3 +290,9 @@ jobs:
       - name: Show sccache statistics
         if: always()
         run: sccache --show-stats || true
+
+      - name: Clean temporary Git credential rewrite
+        if: always()
+        run: |
+          git config --global --name-only --get-regexp '^url\..*github\.com/ospreydb/ospreydb\.insteadOf$' \
+            | xargs -r -n1 git config --global --unset-all || true

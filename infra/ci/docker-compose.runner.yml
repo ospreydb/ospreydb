@@ -23,6 +23,8 @@ services:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
+      # Optional read-only token for fetching private ospreydb/ospreydb crates (unless set via GitHub Secret OSPREY_CORE_TOKEN)
+      OSPREY_CORE_TOKEN: ${OSPREY_CORE_TOKEN:-}
     volumes:
       # Docker-out-of-Docker for Buildx multi-arch Distroless image builds
       - /var/run/docker.sock:/var/run/docker.sock

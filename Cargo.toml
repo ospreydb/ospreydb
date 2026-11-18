@@ -12,9 +12,9 @@ license = "LicenseRef-OspreyDB-Commercial"
 repository = "https://github.com/ospreydb/osprey-pro"
 
 [workspace.dependencies]
-osprey-core = { path = "/home/ramos/repositories/osprey/crates/osprey-core", version = "0.1.0" }
-osprey-simd = { path = "/home/ramos/repositories/osprey/crates/osprey-simd", version = "0.1.0" }
-osprey-storage = { path = "/home/ramos/repositories/osprey/crates/osprey-storage", version = "0.1.0" }
+osprey-core = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.0" }
+osprey-simd = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.0" }
+osprey-storage = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.0" }
 
 arrow = "53"
 arrow-flight = "53.4"
