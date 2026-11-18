@@ -19,7 +19,10 @@ use tokio::net::TcpListener;
 use crate::delta_buffer::HybridSearchEngine;
 use crate::embedder::Embedder;
 use crate::error::{ProEngineError, ProResult};
-use crate::license::{OspreyLicense, VectorQuotaState, COMMUNITY_MAX_VECTORS};
+use crate::license::{
+    current_unix_secs, OfflineLicenseVerifier, OspreyLicense, VectorQuotaState,
+    COMMUNITY_MAX_VECTORS,
+};
 use crate::metrics::ProMetricsRegistry;
 use crate::rerank_service::LutRankReranker;
 
@@ -109,6 +112,7 @@ pub fn build_http_router(state: HttpServerState) -> Router {
         .route("/metrics", get(handle_metrics))
         .route("/v1/rerank", post(handle_cohere_rerank))
         .route("/v1/embeddings", post(handle_embeddings))
+        .route("/v1/license/activate", post(handle_license_activate))
         .route(
             "/collections/{name}/points/search",
             post(handle_qdrant_search),
@@ -450,9 +454,7 @@ async fn handle_qdrant_upsert(
     let embedding_count = u64::try_from(texts_to_embed.len()).unwrap_or(0);
 
     // Enforce community tier vector limit
-    if let Err(limit_err) = state.check_vector_limit(
-        u64::try_from(req.points.len()).unwrap_or(0)
-    ) {
+    if let Err(limit_err) = state.check_vector_limit(u64::try_from(req.points.len()).unwrap_or(0)) {
         let status_code = if matches!(limit_err, ProEngineError::CommunityTierLimitReached { .. }) {
             StatusCode::from_u16(402).unwrap_or(StatusCode::PAYMENT_REQUIRED)
         } else {
@@ -517,7 +519,7 @@ async fn handle_qdrant_upsert(
         .enumerate()
         .zip(payload_bytes.iter())
         .filter_map(|((idx, p), payload)| {
-let vector_ref = if !p.vector.is_empty() {
+            let vector_ref = if !p.vector.is_empty() {
                 Some(p.vector.as_slice())
             } else if let Some(ctx) = &needs_vector_context {
                 ctx.get(&idx).map(|v| v.as_slice())
@@ -594,16 +596,20 @@ async fn handle_qdrant_collection_info(
     let segments = engine.loaded_segment_count().unwrap_or(0);
     let total_vecs = state.total_vector_count();
     let limit_reached = state.quota.is_limit_reached();
+    let now_secs = current_unix_secs().unwrap_or(0);
     let license_info = state
         .quota
         .active_license_snapshot()
         .map(|lic| {
+            let in_grace_period = lic.is_in_grace_period_at(now_secs);
             json!({
                 "tier": lic.tier,
                 "max_vectors": lic.max_vectors,
                 "is_unlimited": lic.is_unlimited_vectors(),
                 "limit_reached": limit_reached,
                 "read_only": limit_reached,
+                "in_grace_period": in_grace_period,
+                "grace_days_remaining": lic.grace_days_remaining_at(now_secs),
             })
         })
         .unwrap_or_else(|| {
@@ -613,6 +619,8 @@ async fn handle_qdrant_collection_info(
                 "is_unlimited": false,
                 "limit_reached": limit_reached,
                 "read_only": limit_reached,
+                "in_grace_period": false,
+                "grace_days_remaining": 0,
             })
         });
 
@@ -732,4 +740,68 @@ async fn handle_embeddings(
         )
             .into_response(),
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LicenseActivateRequest {
+    license: String,
+}
+
+async fn handle_license_activate(
+    State(state): State<HttpServerState>,
+    Json(req): Json<LicenseActivateRequest>,
+) -> Response {
+    let verifier = match OfflineLicenseVerifier::new() {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "status": { "error": err.to_string() } })),
+            )
+                .into_response();
+        }
+    };
+
+    let lic = match verifier.verify_now(req.license.trim()) {
+        Ok(l) => l,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "status": { "error": err.to_string() } })),
+            )
+                .into_response();
+        }
+    };
+
+    let now_secs = current_unix_secs().unwrap_or(0);
+    let in_grace = lic.is_in_grace_period_at(now_secs);
+    let grace_days = lic.grace_days_remaining_at(now_secs);
+    if in_grace {
+        tracing::warn!(
+            org = %lic.customer_org,
+            tier = %lic.tier,
+            expires_at = lic.expires_at,
+            grace_days_remaining = grace_days,
+            "activated expired license inside 30-day renewal grace period; renew before grace deadline to avoid Pro startup block"
+        );
+    }
+
+    state.activate_license(lic.clone());
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "result": {
+                "customer_org": lic.customer_org,
+                "tier": lic.tier,
+                "max_nodes": lic.max_nodes,
+                "max_vectors": lic.max_vectors,
+                "is_unlimited": lic.is_unlimited_vectors(),
+                "expires_at": lic.expires_at,
+                "in_grace_period": in_grace,
+                "grace_days_remaining": grace_days,
+            }
+        })),
+    )
+        .into_response()
 }

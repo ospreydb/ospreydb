@@ -74,8 +74,10 @@ pub enum ProLicenseError {
         now_unix_secs: u64,
     },
 
-    /// License has expired at `now_unix_secs`.
-    #[error("license expired at {expires_at} (current time {now_unix_secs})")]
+    /// License has expired past the 30-day renewal grace period at `now_unix_secs`.
+    #[error(
+        "license expired at {expires_at} and exceeded the 30-day renewal grace period (current time {now_unix_secs})"
+    )]
     LicenseExpired {
         /// Token expiration timestamp (Unix seconds UTC).
         expires_at: u64,
@@ -117,8 +119,8 @@ pub enum ProEngineError {
 
     /// Community tier hard vector limit reached (5M) — requires a Pro license activation.
     #[error(
-        "Community Tier limit ({limit} vectors) reached. Activate Founding or Enterprise \
-         license via 'osprey pro activate --license <KEY>' — see https://ospreydb.dev/pricing"
+        "Community Tier limit ({limit} vectors) reached. Activate a Pro license via \
+         'osprey-pro activate --license <KEY>' — see https://ospreydb.dev/pricing"
     )]
     CommunityTierLimitReached {
         /// Hard limit (defaults to [`crate::license::COMMUNITY_MAX_VECTORS`]).

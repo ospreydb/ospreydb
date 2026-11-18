@@ -6,12 +6,12 @@ OspreyDB Pro is deployed **entirely inside your own AWS, GCP, Azure, or on-premi
 There is no OspreyDB-managed SaaS control plane, no telemetry phone-home, and no multi-tenant gateway.
 You own the S3 buckets, the EC2/GCE instances, the IAM roles, and the WAL disks.
 
-## Perpetual License with 1 Year of Updates
+## Annual Subscription & 30-Day Renewal Grace Period
 
-Every commercial license is **perpetual** for the purchased major version series. The license fee
-includes **12 months of updates** (minor and patch releases). After year one, a renewal extends
-update eligibility for another year. The licensed binary **continues to run indefinitely** even
-if the update subscription lapses — there is no remote kill-switch.
+Every commercial license is an **annual subscription** with **all updates included** during the
+active 12-month term and a **30-day renewal grace period** after `expires_at` to prevent accidental
+production outages during billing renewal. After the 30-day grace window expires, Pro-tier startup
+is blocked until a renewed key is supplied. There is zero phone-home and no remote kill-switch.
 
 ## Support Channels
 
@@ -33,6 +33,8 @@ is available as a separately priced add-on for Enterprise license holders. Conta
 
 ## Self-Service Resources
 
-- [Architecture Reference](./ARCHITECTURE.md)
+- [OspreyDB Pro README](./README.md)
+- [End-User License Agreement (EULA)](./EULA.md)
+- [Core Architecture Reference](https://github.com/ospreydb/ospreydb/blob/main/ARCHITECTURE.md)
 - [ospreydb.dev/docs](https://ospreydb.dev/docs)
 - [GitHub Releases](https://github.com/ospreydb/osprey-pro/releases)

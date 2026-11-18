@@ -17,10 +17,10 @@ use object_store::ObjectStore;
 use osprey_core::math::padded_dimension;
 use osprey_core::{ProCapability, RawVectorRecord};
 use osprey_pro::{
-    serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder, EmbedderConfig,
-    HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker, ManifestStore,
-    OfflineLicenseVerifier, OspreyFlightService, OspreyWal, ProEngineError, ProMetricsRegistry,
-    ProResult, VectorQuotaState, WalConfig, WalRecoveryMode, WalSyncPolicy,
+    current_unix_secs, serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder,
+    EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
+    ManifestStore, OfflineLicenseVerifier, OspreyFlightService, OspreyWal, ProEngineError,
+    ProMetricsRegistry, ProResult, VectorQuotaState, WalConfig, WalRecoveryMode, WalSyncPolicy,
     DEFAULT_ARROW_FLIGHT_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
 };
 use osprey_storage::{
@@ -46,7 +46,17 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve(Box<ServeArgs>),
+    Activate(ActivateArgs),
     WalStress(WalStressArgs),
+}
+
+#[derive(Debug, Args)]
+struct ActivateArgs {
+    #[arg(long)]
+    license: String,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -66,7 +76,7 @@ struct ServeArgs {
     #[arg(long, default_value = "./osprey-pro.wal")]
     wal_path: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, alias = "s3-manifest", env = "OSPREY_OBJECT_STORE_URI")]
     object_store_uri: Option<String>,
 
     #[arg(long, default_value = DEFAULT_ARROW_FLIGHT_ADDR)]
@@ -82,7 +92,11 @@ struct ServeArgs {
     #[arg(long, env = "OSPREY_EMBED_URL")]
     embed_url: Option<String>,
 
-    #[arg(long, env = "OSPREY_EMBED_MODEL", default_value = "text-embedding-3-small")]
+    #[arg(
+        long,
+        env = "OSPREY_EMBED_MODEL",
+        default_value = "text-embedding-3-small"
+    )]
     embed_model: String,
 
     #[arg(long, env = "OSPREY_EMBED_API_KEY")]
@@ -107,6 +121,76 @@ struct WalStressArgs {
     batch_size: usize,
 }
 
+fn default_license_path() -> ProResult<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        ProEngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME environment variable is not set",
+        ))
+    })?;
+    Ok(PathBuf::from(home).join(".osprey").join("license.key"))
+}
+
+fn load_license_token(explicit: Option<&str>) -> ProResult<Option<String>> {
+    if let Some(tok) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some(tok.to_owned()));
+    }
+    if let Ok(path) = default_license_path() {
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path)?;
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                tracing::info!(path = %path.display(), "loaded persisted license key");
+                return Ok(Some(trimmed.to_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn run_activate(args: ActivateArgs) -> ProResult<()> {
+    let token = args.license.trim();
+    let verifier = OfflineLicenseVerifier::new()?;
+    let lic = verifier.verify_now(token)?;
+    let now_secs = current_unix_secs()?;
+
+    let out_path = match args.output {
+        Some(p) => p,
+        None => default_license_path()?,
+    };
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&out_path, format!("{token}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    if lic.is_in_grace_period_at(now_secs) {
+        tracing::warn!(
+            org = %lic.customer_org,
+            tier = %lic.tier,
+            expires_at = lic.expires_at,
+            grace_days_remaining = lic.grace_days_remaining_at(now_secs),
+            "activated license is expired and inside the 30-day renewal grace period"
+        );
+    }
+    println!(
+        "Activated OspreyDB Pro license for '{}' (tier={}, max_vectors={}, saved to {})",
+        lic.customer_org,
+        lic.tier,
+        if lic.is_unlimited_vectors() {
+            "unlimited".to_owned()
+        } else {
+            lic.max_vectors.to_string()
+        },
+        out_path.display()
+    );
+    Ok(())
+}
+
 async fn run_serve(args: ServeArgs) -> ProResult<()> {
     let embedder_config = EmbedderConfig {
         embed_url: args.embed_url.unwrap_or_default(),
@@ -117,18 +201,32 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
     let embedder = Arc::new(Embedder::new(embedder_config));
 
     let verifier = OfflineLicenseVerifier::new()?;
-    let active_license = if let Some(token) = &args.license {
+    let license_token = load_license_token(args.license.as_deref())?;
+    let active_license = if let Some(token) = &license_token {
+        let now_secs = current_unix_secs()?;
         let lic = verifier.verify_now(token)?;
-        let _ = verifier.verify_and_activate(token, lic.issued_at)?;
-        tracing::info!(
-            org = %lic.customer_org,
-            tier = %lic.tier,
-            max_nodes = lic.max_nodes,
-            max_vectors = lic.max_vectors,
-            unlimited_vectors = lic.is_unlimited_vectors(),
-            arrow_flight = lic.has_capability(ProCapability::ArrowFlight),
-            "verified offline Ed25519 commercial license"
-        );
+        let _ = verifier.verify_and_activate(token, now_secs)?;
+        if lic.is_in_grace_period_at(now_secs) {
+            let days_left = lic.grace_days_remaining_at(now_secs);
+            tracing::warn!(
+                org = %lic.customer_org,
+                tier = %lic.tier,
+                expires_at = lic.expires_at,
+                grace_deadline = lic.grace_deadline(),
+                grace_days_remaining = days_left,
+                "OspreyDB Pro license expired; running inside 30-day renewal grace period ({days_left} days remaining before Pro startup is blocked)"
+            );
+        } else {
+            tracing::info!(
+                org = %lic.customer_org,
+                tier = %lic.tier,
+                max_nodes = lic.max_nodes,
+                max_vectors = lic.max_vectors,
+                unlimited_vectors = lic.is_unlimited_vectors(),
+                arrow_flight = lic.has_capability(ProCapability::ArrowFlight),
+                "verified offline Ed25519 commercial license"
+            );
+        }
         Some(lic)
     } else {
         tracing::info!(
@@ -156,20 +254,35 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         );
     }
 
-    let store: Arc<dyn ObjectStore> = match &args.object_store_uri {
+    let (store, manifest_key): (Arc<dyn ObjectStore>, String) = match &args.object_store_uri {
         Some(uri) if uri.starts_with("file://") => {
             let local_path = uri.trim_start_matches("file://");
             std::fs::create_dir_all(local_path)?;
-            Arc::new(LocalFileSystem::new_with_prefix(local_path)?)
+            (
+                Arc::new(LocalFileSystem::new_with_prefix(local_path)?),
+                DEFAULT_MANIFEST_KEY.to_owned(),
+            )
         }
         Some(uri) => {
-            let (s, _path) = build_object_store(uri, &RemoteStoreConfig::default())?;
-            s
+            let (s, path) = build_object_store(uri, &RemoteStoreConfig::default())?;
+            let path_str = path.to_string();
+            let key = if path_str.is_empty() {
+                DEFAULT_MANIFEST_KEY.to_owned()
+            } else if path_str.ends_with(".json") {
+                path_str
+            } else {
+                format!(
+                    "{}/{}",
+                    path_str.trim_end_matches('/'),
+                    DEFAULT_MANIFEST_KEY
+                )
+            };
+            (s, key)
         }
-        None => Arc::new(InMemory::new()),
+        None => (Arc::new(InMemory::new()), DEFAULT_MANIFEST_KEY.to_owned()),
     };
 
-    let manifest_store = ManifestStore::new(Arc::clone(&store), DEFAULT_MANIFEST_KEY);
+    let manifest_store = ManifestStore::new(Arc::clone(&store), manifest_key);
     let metrics = Arc::new(ProMetricsRegistry::new());
     let engine = Arc::new(HybridSearchEngine::with_metrics(
         Arc::clone(&delta),
@@ -315,6 +428,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let res = match cli.command {
         Some(Command::Serve(args)) => run_serve(*args).await,
+        Some(Command::Activate(args)) => run_activate(args),
         Some(Command::WalStress(args)) => run_wal_stress(args),
         None => run_serve(cli.serve).await,
     };

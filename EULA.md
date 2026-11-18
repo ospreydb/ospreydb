@@ -6,9 +6,9 @@
 
 ## 1. Grant of License
 
-Subject to payment of the applicable license fee and compliance with this EULA, Licensor grants
-Licensee a **perpetual, non-exclusive, non-transferable, worldwide license** to install and run
-one (1) instance of the OspreyDB Pro binary per licensed node, solely for Licensee's internal
+Subject to payment of the applicable subscription fee and compliance with this EULA, Licensor grants
+Licensee a **non-exclusive, non-transferable, worldwide annual subscription license** to install and
+run one (1) instance of the OspreyDB Pro binary per licensed node, solely for Licensee's internal
 business operations.
 
 - **Community / Personal Free Tier:** Running `osprey-pro` without a license key activates a
@@ -28,12 +28,15 @@ instances, IAM roles, or VPC networks. The offline Ed25519 license verification 
 **zero phone-home calls** — there is no telemetry, no license check server, and no remote
 kill-switch.
 
-## 3. Perpetual License with Update Term
+## 3. Annual Subscription with 30-Day Renewal Grace Period
 
-Each license is **perpetual** for the major version series acquired. The license fee includes
-**12 months of updates** (minor and patch releases). After year one, an annual renewal fee
-extends update eligibility for another 12 months. The licensed binary continues to run
-indefinitely even if the update subscription lapses.
+Each commercial license is an **annual subscription** that includes **all software updates**
+(major, minor, and patch releases) throughout the active 12-month term. To prevent accidental
+production downtime if payment renewal is delayed, the offline Ed25519 verifier enforces a
+**30-day renewal grace period** past `expires_at` (emitting explicit warning logs). Once the
+30-day grace period elapses without a renewed key, Pro-tier startup is blocked until a valid
+subscription key is activated, while existing on-disk/S3 data remains readable via the open-core
+`osprey` CLI.
 
 ## 4. Restrictions
 

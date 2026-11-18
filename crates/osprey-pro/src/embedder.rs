@@ -113,8 +113,7 @@ impl Embedder {
     /// Returns `true` when an embedding endpoint is configured and ready.
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        !self.config.embed_url.is_empty()
-            && !self.config.embed_model.is_empty()
+        !self.config.embed_url.is_empty() && !self.config.embed_model.is_empty()
     }
 
     /// Returns the configured embedding model name.
@@ -159,9 +158,10 @@ impl Embedder {
         for chunk in chunks {
             let embedder = self.clone();
             let chunk_owned: Vec<String> = chunk.to_vec();
-            let handle = tokio::spawn(async move {
-                embedder.embed_single_batch_with_retry(&chunk_owned).await
-            });
+            let handle =
+                tokio::spawn(
+                    async move { embedder.embed_single_batch_with_retry(&chunk_owned).await },
+                );
             handles.push(handle);
         }
 
@@ -195,15 +195,16 @@ impl Embedder {
             .ok_or_else(|| ProEngineError::Io(std::io::Error::other("empty embedding response")))
     }
 
-    async fn embed_single_batch_with_retry(
-        &self,
-        texts: &[String],
-    ) -> ProResult<Vec<Vec<f32>>> {
-        let _permit = self.semaphore.acquire().await.map_err(|_| {
-            ProEngineError::Io(std::io::Error::other("embedder semaphore closed"))
-        })?;
+    async fn embed_single_batch_with_retry(&self, texts: &[String]) -> ProResult<Vec<Vec<f32>>> {
+        let _permit =
+            self.semaphore.acquire().await.map_err(|_| {
+                ProEngineError::Io(std::io::Error::other("embedder semaphore closed"))
+            })?;
 
-        let endpoint = format!("{}/v1/embeddings", self.config.embed_url.trim_end_matches('/'));
+        let endpoint = format!(
+            "{}/v1/embeddings",
+            self.config.embed_url.trim_end_matches('/')
+        );
         let body = EmbedRequest {
             model: &self.config.embed_model,
             input: texts,
@@ -211,10 +212,7 @@ impl Embedder {
         };
 
         for attempt in 0..MAX_RETRIES {
-            let mut req = self
-                .client
-                .post(&endpoint)
-                .json(&body);
+            let mut req = self.client.post(&endpoint).json(&body);
 
             if let Some(ref key) = self.config.api_key {
                 req = req.bearer_auth(key);
@@ -237,27 +235,21 @@ impl Embedder {
                             "embedding batch completed"
                         );
 
-                        let mut sorted: Vec<Option<Vec<f32>>> =
-                            vec![None; embed_resp.data.len()];
+                        let mut sorted: Vec<Option<Vec<f32>>> = vec![None; embed_resp.data.len()];
                         for item in embed_resp.data {
                             if item.index < sorted.len() {
                                 sorted[item.index] = Some(item.embedding);
                             }
                         }
-                        let embeddings: Vec<Vec<f32>> =
-                            sorted.into_iter().flatten().collect();
+                        let embeddings: Vec<Vec<f32>> = sorted.into_iter().flatten().collect();
                         return Ok(embeddings);
                     }
 
                     if status.as_u16() == 429 {
                         if attempt + 1 < MAX_RETRIES {
-                            let delay_ms = BASE_BACKOFF_MS
-                                .saturating_mul(1 << attempt)
-                                .min(30_000);
+                            let delay_ms = BASE_BACKOFF_MS.saturating_mul(1 << attempt).min(30_000);
                             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                            let jitter = (f64::from(delay_ms as u32) * 0.25
-                                * rand_factor())
-                                as u64;
+                            let jitter = (f64::from(delay_ms as u32) * 0.25 * rand_factor()) as u64;
                             let wait = Duration::from_millis(delay_ms + jitter);
                             tracing::warn!(
                                 attempt = attempt + 1,
@@ -267,11 +259,9 @@ impl Embedder {
                             tokio::time::sleep(wait).await;
                             continue;
                         }
-                        return Err(ProEngineError::Io(std::io::Error::other(
-                            format!(
-                                "embedding endpoint rate-limited after {MAX_RETRIES} attempts"
-                            ),
-                        )));
+                        return Err(ProEngineError::Io(std::io::Error::other(format!(
+                            "embedding endpoint rate-limited after {MAX_RETRIES} attempts"
+                        ))));
                     }
 
                     let error_body = resp.text().await.unwrap_or_default();

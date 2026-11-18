@@ -7,8 +7,8 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use osprey_core::{LicenseVerifier, ProCapability};
 use osprey_pro::{
-    OfflineLicenseVerifier, OspreyLicense, ProLicenseError, LICENSE_TOKEN_PREFIX,
-    MAX_CLOCK_SKEW_SECS, MAX_LICENSE_TOKEN_BYTES,
+    OfflineLicenseVerifier, OspreyLicense, ProLicenseError, LICENSE_GRACE_PERIOD_SECS,
+    LICENSE_TOKEN_PREFIX, MAX_CLOCK_SKEW_SECS, MAX_LICENSE_TOKEN_BYTES,
 };
 use rand::rngs::OsRng;
 
@@ -173,10 +173,20 @@ fn boundary_timestamps_and_skew_tolerance() {
     };
     let token = issue_test_token(&key, &license);
 
-    // Exact boundary: 1 second before expiry passes; at expiry fails.
-    assert!(verifier.verify(&token, expires_at - 1).is_ok());
+    // Before expiry: active and not in grace period.
+    let active = verifier.verify(&token, expires_at - 1).unwrap();
+    assert!(!active.is_in_grace_period_at(expires_at - 1));
+
+    // At expiry through +30 days: permitted inside 30-day renewal grace period.
+    let in_grace = verifier.verify(&token, expires_at).unwrap();
+    assert!(in_grace.is_in_grace_period_at(expires_at));
+    assert!(verifier
+        .verify(&token, expires_at + LICENSE_GRACE_PERIOD_SECS)
+        .is_ok());
+
+    // 1 second past the 30-day grace period: blocked with LicenseExpired.
     assert!(matches!(
-        verifier.verify(&token, expires_at),
+        verifier.verify(&token, expires_at + LICENSE_GRACE_PERIOD_SECS + 1),
         Err(ProLicenseError::LicenseExpired { .. })
     ));
 

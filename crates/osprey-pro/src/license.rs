@@ -40,6 +40,9 @@ pub const EMBEDDED_PUBLIC_KEY: &[u8; 32] = include_bytes!("osprey_pro_ed25519.pu
 /// Community tier hard limit: 5,000,000 vectors without a Pro license key.
 pub const COMMUNITY_MAX_VECTORS: u64 = 5_000_000;
 
+/// Renewal grace period after `expires_at` before Pro mode is blocked (30 days in seconds).
+pub const LICENSE_GRACE_PERIOD_SECS: u64 = 30 * 86_400;
+
 /// Commercial license claims decoded from an `OSPREY-PRO-v1.<payload>.<sig>` token.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OspreyLicense {
@@ -87,10 +90,38 @@ impl OspreyLicense {
         self.has_feature(capability_name(capability))
     }
 
-    /// Returns `true` if the license is expired at `now_unix_secs`.
+    /// Returns `true` if the license is past its nominal `expires_at` timestamp at `now_unix_secs`.
     #[must_use]
     pub const fn is_expired_at(&self, now_unix_secs: u64) -> bool {
         now_unix_secs >= self.expires_at
+    }
+
+    /// Returns the hard cutoff Unix timestamp (`expires_at + 30 days`) after which Pro mode is blocked.
+    #[must_use]
+    pub const fn grace_deadline(&self) -> u64 {
+        self.expires_at.saturating_add(LICENSE_GRACE_PERIOD_SECS)
+    }
+
+    /// Returns `true` if the license is past `expires_at` but still within the 30-day renewal grace period.
+    #[must_use]
+    pub const fn is_in_grace_period_at(&self, now_unix_secs: u64) -> bool {
+        now_unix_secs >= self.expires_at && now_unix_secs <= self.grace_deadline()
+    }
+
+    /// Returns `true` if `now_unix_secs` is strictly past the 30-day renewal grace period.
+    #[must_use]
+    pub const fn is_past_grace_period_at(&self, now_unix_secs: u64) -> bool {
+        now_unix_secs > self.grace_deadline()
+    }
+
+    /// Returns the remaining whole days in the 30-day grace period, or `0` if not in grace period.
+    #[must_use]
+    pub const fn grace_days_remaining_at(&self, now_unix_secs: u64) -> u64 {
+        if self.is_in_grace_period_at(now_unix_secs) {
+            self.grace_deadline().saturating_sub(now_unix_secs) / 86_400
+        } else {
+            0
+        }
     }
 
     /// Returns `true` if `active_nodes` does not exceed [`Self::max_nodes`] (`0` = unlimited).
@@ -281,11 +312,7 @@ impl OfflineLicenseVerifier {
 
     /// Verifies `token` using the current system UTC clock.
     pub fn verify_now(&self, token: &str) -> Result<OspreyLicense, ProLicenseError> {
-        let now_unix_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ProLicenseError::SystemClockError)?
-            .as_secs();
-        self.verify(token, now_unix_secs)
+        self.verify(token, current_unix_secs()?)
     }
 
     /// Verifies `token` offline and ensures `required_feature` is granted.
@@ -388,13 +415,21 @@ fn validate_claims(license: &OspreyLicense, now_unix_secs: u64) -> Result<(), Pr
             now_unix_secs,
         });
     }
-    if license.is_expired_at(now_unix_secs) {
+    if license.is_past_grace_period_at(now_unix_secs) {
         return Err(ProLicenseError::LicenseExpired {
             expires_at: license.expires_at,
             now_unix_secs,
         });
     }
     Ok(())
+}
+
+/// Returns the current UTC Unix timestamp in seconds.
+pub fn current_unix_secs() -> Result<u64, ProLicenseError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| ProLicenseError::SystemClockError)
 }
 
 /// Shared thread-safe vector quota tracker enforced across HTTP and Arrow Flight ingestion.
@@ -607,12 +642,17 @@ mod tests {
         let expires_at = issued_at + 3600;
         let token = sign_test_token(&signing_key, &sample_license(issued_at, expires_at));
 
+        // Within 30-day grace period succeeds with grace metadata flagged
+        let grace_lic = verifier.verify(&token, expires_at).unwrap();
+        assert!(grace_lic.is_in_grace_period_at(expires_at));
+        assert_eq!(grace_lic.grace_days_remaining_at(expires_at), 30);
+        assert!(verifier
+            .verify(&token, expires_at + LICENSE_GRACE_PERIOD_SECS)
+            .is_ok());
+
+        // Strictly past 30-day grace period fails with LicenseExpired
         assert!(matches!(
-            verifier.verify(&token, expires_at),
-            Err(ProLicenseError::LicenseExpired { .. })
-        ));
-        assert!(matches!(
-            verifier.verify(&token, expires_at + 100),
+            verifier.verify(&token, expires_at + LICENSE_GRACE_PERIOD_SECS + 1),
             Err(ProLicenseError::LicenseExpired { .. })
         ));
         assert!(matches!(

@@ -71,6 +71,11 @@ jobs:
             chmod +x "${CARGO_HOME}/bin/sccache"
           fi
 
+      - name: Cargo fmt check
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
       - name: Cargo check
         run: |
           set -euo pipefail

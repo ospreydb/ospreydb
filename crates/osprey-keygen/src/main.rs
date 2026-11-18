@@ -29,14 +29,11 @@ const ALL_PRO_FEATURES: &[&str] = &[
     "arrow_flight",
     "rerank_http",
     "qdrant_compat",
+    "embeddings_proxy",
 ];
 
 /// Feature set for Beta / Design Partner tier (90-day free).
-const BETA_FEATURES: &[&str] = &[
-    "wal_streaming",
-    "cow_compactor",
-    "qdrant_compat",
-];
+const BETA_FEATURES: &[&str] = &["wal_streaming", "cow_compactor", "qdrant_compat"];
 
 /// Feature set for Founding tier (discounted Early Access, 1-year).
 const FOUNDING_FEATURES: &[&str] = &[
@@ -47,6 +44,7 @@ const FOUNDING_FEATURES: &[&str] = &[
     "arrow_flight",
     "rerank_http",
     "qdrant_compat",
+    "embeddings_proxy",
 ];
 
 /// Feature set for Enterprise tier (unlimited scale, multi-node, Arrow Flight).
@@ -58,6 +56,7 @@ const ENTERPRISE_FEATURES: &[&str] = &[
     "arrow_flight",
     "rerank_http",
     "qdrant_compat",
+    "embeddings_proxy",
 ];
 
 #[derive(Debug, Error)]
@@ -307,19 +306,22 @@ fn resolve_features(tier: &str, provided: &[String], all: bool) -> Vec<String> {
     match tier {
         "beta" => BETA_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
         "founding" => FOUNDING_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
-        "enterprise" => ENTERPRISE_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
+        "enterprise" => ENTERPRISE_FEATURES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
         _ => ALL_PRO_FEATURES.iter().map(|s| (*s).to_owned()).collect(),
     }
 }
 
-/// Resolves max_vectors based on tier: founding/enterprise are unlimited (0),
-/// beta defaults to 100k, others keep user-provided value.
+/// Resolves max_vectors based on tier: commercial tiers (`pro`, `founding`, `team`, `enterprise`, `oem`)
+/// are unlimited (`0`), `beta` defaults to 100k, others fall back to Community Tier (5M).
 fn resolve_max_vectors(tier: &str, user_value: u64) -> u64 {
     if user_value != 0 {
         return user_value;
     }
     match tier {
-        "founding" | "enterprise" => 0,
+        "pro" | "founding" | "team" | "enterprise" | "oem" => 0,
         "beta" => 100_000,
         _ => COMMUNITY_MAX_VECTORS,
     }
@@ -506,19 +508,31 @@ mod tests {
     fn tier_resolves_correct_features_and_vector_limits() {
         assert_eq!(
             resolve_features("beta", &[], false),
-            BETA_FEATURES.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+            BETA_FEATURES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             resolve_features("founding", &[], false),
-            FOUNDING_FEATURES.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+            FOUNDING_FEATURES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             resolve_features("enterprise", &[], false),
-            ENTERPRISE_FEATURES.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+            ENTERPRISE_FEATURES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>()
         );
 
+        assert_eq!(resolve_max_vectors("pro", 0), 0);
         assert_eq!(resolve_max_vectors("founding", 0), 0);
+        assert_eq!(resolve_max_vectors("team", 0), 0);
         assert_eq!(resolve_max_vectors("enterprise", 0), 0);
+        assert_eq!(resolve_max_vectors("oem", 0), 0);
         assert_eq!(resolve_max_vectors("beta", 0), 100_000);
         assert_eq!(resolve_max_vectors("beta", 5000), 5000);
         assert_eq!(resolve_max_vectors("unknown", 0), COMMUNITY_MAX_VECTORS);

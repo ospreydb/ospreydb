@@ -136,6 +136,15 @@ async fn community_tier_limit_returns_402_payment_required() {
         .unwrap();
     assert_eq!(health_resp.status().as_u16(), 200);
 
+    // Hot-activation endpoint rejects malformed/untrusted keys cleanly with HTTP 403
+    let bad_activate = client
+        .post(format!("{base_url}/v1/license/activate"))
+        .json(&json!({ "license": "OSPREY-PRO-v1.invalid.sig" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_activate.status().as_u16(), 403);
+
     let _ = tx.send(());
     let _ = server_handle.await;
 }
@@ -499,8 +508,12 @@ async fn collection_info_exposes_license_and_embedder_metadata() {
         info["result"]["license"]["max_vectors"],
         COMMUNITY_MAX_VECTORS
     );
-    assert!(info["result"]["embedder"]["configured"].as_bool().is_some_and(|c| !c));
-    assert!(info["result"]["embedder"]["model"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(info["result"]["embedder"]["configured"]
+        .as_bool()
+        .is_some_and(|c| !c));
+    assert!(info["result"]["embedder"]["model"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
 
     let _ = tx.send(());
     let _ = server_handle.await;
