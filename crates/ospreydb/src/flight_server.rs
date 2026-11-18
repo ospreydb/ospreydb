@@ -7,8 +7,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryArray, BinaryBuilder, FixedSizeListArray, Float32Array, Float32Builder, ListArray,
-    StringArray, StringBuilder, UInt32Array, UInt64Array, UInt64Builder,
+    Array, BinaryArray, BinaryBuilder, FixedSizeListArray, Float32Array, Float32Builder,
+    Float64Array, LargeListArray, ListArray, StringArray, StringBuilder, UInt32Array, UInt64Array,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -46,6 +47,7 @@ pub struct OspreyFlightService {
     quota: VectorQuotaState,
     default_nprobe: usize,
     default_top_k: usize,
+    read_only: bool,
 }
 
 impl OspreyFlightService {
@@ -68,7 +70,15 @@ impl OspreyFlightService {
             quota,
             default_nprobe: 16,
             default_top_k: 10,
+            read_only: false,
         }
+    }
+
+    /// Marks this Arrow Flight service read-only (for `--role reader` nodes), rejecting `DoPut`.
+    #[must_use]
+    pub const fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     fn search_result_schema() -> Arc<Schema> {
@@ -268,66 +278,158 @@ impl OspreyFlightService {
     }
 }
 
-enum BorrowedVectorColumn<'a> {
-    Contiguous {
+enum ExtractedVectorColumn<'a> {
+    BorrowedContiguous {
         values: &'a [f32],
         dim: usize,
     },
-    Ragged {
-        list: &'a ListArray,
+    BorrowedList {
+        offsets: &'a [i32],
         values: &'a [f32],
+    },
+    BorrowedLargeList {
+        offsets: &'a [i64],
+        values: &'a [f32],
+    },
+    OwnedContiguous {
+        values: Vec<f32>,
+        dim: usize,
+    },
+    OwnedRagged {
+        ranges: Vec<(usize, usize)>,
+        values: Vec<f32>,
     },
 }
 
-impl<'a> BorrowedVectorColumn<'a> {
-    fn slice_at(&self, row: usize) -> &'a [f32] {
+impl<'a> ExtractedVectorColumn<'a> {
+    fn slice_at(&self, row: usize) -> &[f32] {
         match self {
-            Self::Contiguous { values, dim } => &values[row * *dim..(row + 1) * *dim],
-            Self::Ragged { list, values } => {
-                let offsets = list.value_offsets();
+            Self::BorrowedContiguous { values, dim } => &values[row * *dim..(row + 1) * *dim],
+            Self::BorrowedList { offsets, values } => {
                 let start = usize::try_from(offsets[row]).unwrap_or(0);
                 let end = usize::try_from(offsets[row + 1]).unwrap_or(start);
+                &values[start..end]
+            }
+            Self::BorrowedLargeList { offsets, values } => {
+                let start = usize::try_from(offsets[row]).unwrap_or(0);
+                let end = usize::try_from(offsets[row + 1]).unwrap_or(start);
+                &values[start..end]
+            }
+            Self::OwnedContiguous { values, dim } => &values[row * *dim..(row + 1) * *dim],
+            Self::OwnedRagged { ranges, values } => {
+                let (start, end) = ranges[row];
                 &values[start..end]
             }
         }
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn f64_slice_to_f32(vals: &[f64]) -> Vec<f32> {
+    vals.iter().map(|&v| v as f32).collect()
+}
+
 #[allow(clippy::result_large_err)]
 fn extract_vector_slices<'a>(
     col: &'a dyn Array,
     num_rows: usize,
-) -> Result<BorrowedVectorColumn<'a>, Status> {
+) -> Result<ExtractedVectorColumn<'a>, Status> {
+    if col.null_count() > 0 {
+        return Err(Status::invalid_argument(
+            "'vector' column must not contain null entries",
+        ));
+    }
+
     if let Some(fsl) = col.as_any().downcast_ref::<FixedSizeListArray>() {
         let dim = usize::try_from(fsl.value_length()).unwrap_or(0);
-        let f32_arr = fsl
-            .values()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or_else(|| {
-                Status::invalid_argument("'vector' FixedSizeList must contain Float32")
-            })?;
-        let values = f32_arr.values();
-        if values.len() < num_rows * dim {
+        if let Some(f32_arr) = fsl.values().as_any().downcast_ref::<Float32Array>() {
+            let values = f32_arr.values();
+            if values.len() < num_rows * dim {
+                return Err(Status::invalid_argument(
+                    "truncated FixedSizeList<Float32> vector buffer",
+                ));
+            }
+            return Ok(ExtractedVectorColumn::BorrowedContiguous { values, dim });
+        }
+        if let Some(f64_arr) = fsl.values().as_any().downcast_ref::<Float64Array>() {
+            let raw = f64_arr.values();
+            if raw.len() < num_rows * dim {
+                return Err(Status::invalid_argument(
+                    "truncated FixedSizeList<Float64> vector buffer",
+                ));
+            }
+            return Ok(ExtractedVectorColumn::OwnedContiguous {
+                values: f64_slice_to_f32(&raw[..num_rows * dim]),
+                dim,
+            });
+        }
+        return Err(Status::invalid_argument(
+            "'vector' FixedSizeList must contain Float32 or Float64",
+        ));
+    }
+
+    if let Some(list) = col.as_any().downcast_ref::<ListArray>() {
+        let offsets = list.value_offsets();
+        if offsets.len() < num_rows + 1 {
+            return Err(Status::invalid_argument("truncated List offset buffer"));
+        }
+        if let Some(f32_arr) = list.values().as_any().downcast_ref::<Float32Array>() {
+            return Ok(ExtractedVectorColumn::BorrowedList {
+                offsets,
+                values: f32_arr.values(),
+            });
+        }
+        if let Some(f64_arr) = list.values().as_any().downcast_ref::<Float64Array>() {
+            let ranges = (0..num_rows)
+                .map(|r| {
+                    let s = usize::try_from(offsets[r]).unwrap_or(0);
+                    let e = usize::try_from(offsets[r + 1]).unwrap_or(s);
+                    (s, e)
+                })
+                .collect();
+            return Ok(ExtractedVectorColumn::OwnedRagged {
+                ranges,
+                values: f64_slice_to_f32(f64_arr.values()),
+            });
+        }
+        return Err(Status::invalid_argument(
+            "'vector' List must contain Float32 or Float64",
+        ));
+    }
+
+    if let Some(list) = col.as_any().downcast_ref::<LargeListArray>() {
+        let offsets = list.value_offsets();
+        if offsets.len() < num_rows + 1 {
             return Err(Status::invalid_argument(
-                "truncated FixedSizeList vector buffer",
+                "truncated LargeList offset buffer",
             ));
         }
-        return Ok(BorrowedVectorColumn::Contiguous { values, dim });
+        if let Some(f32_arr) = list.values().as_any().downcast_ref::<Float32Array>() {
+            return Ok(ExtractedVectorColumn::BorrowedLargeList {
+                offsets,
+                values: f32_arr.values(),
+            });
+        }
+        if let Some(f64_arr) = list.values().as_any().downcast_ref::<Float64Array>() {
+            let ranges = (0..num_rows)
+                .map(|r| {
+                    let s = usize::try_from(offsets[r]).unwrap_or(0);
+                    let e = usize::try_from(offsets[r + 1]).unwrap_or(s);
+                    (s, e)
+                })
+                .collect();
+            return Ok(ExtractedVectorColumn::OwnedRagged {
+                ranges,
+                values: f64_slice_to_f32(f64_arr.values()),
+            });
+        }
+        return Err(Status::invalid_argument(
+            "'vector' LargeList must contain Float32 or Float64",
+        ));
     }
-    if let Some(list) = col.as_any().downcast_ref::<ListArray>() {
-        let f32_arr = list
-            .values()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or_else(|| Status::invalid_argument("'vector' List must contain Float32"))?;
-        return Ok(BorrowedVectorColumn::Ragged {
-            list,
-            values: f32_arr.values(),
-        });
-    }
+
     Err(Status::invalid_argument(
-        "'vector' column must be FixedSizeList<Float32> or List<Float32>",
+        "'vector' column must be FixedSizeList<Float32/Float64> or List<Float32/Float64>",
     ))
 }
 
@@ -417,6 +519,11 @@ impl FlightService for OspreyFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        if self.read_only {
+            return Err(Status::failed_precondition(
+                "node is running in read-only (--role reader) mode; DoPut writes are not permitted",
+            ));
+        }
         let mut batch_stream = FlightRecordBatchStream::new_from_flight_data(
             request.into_inner().map_err(FlightError::Tonic),
         );

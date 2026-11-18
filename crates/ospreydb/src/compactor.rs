@@ -1,5 +1,5 @@
-//! Background Copy-on-Write `.osv`/`.osi` slab compactor (`Tarefa 164`) and
-//! `RoaringBitmap` Tombstone Garbage Collector (`Tarefa 166`).
+//! Background Copy-on-Write `.osv`/`.osi` slab compactor and
+//! 64-bit `RoaringTreemap` Tombstone Garbage Collector.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,11 +18,11 @@ use osprey_simd::SimdEngine;
 use osprey_storage::{
     parse_minipage, solve_tsp_locality, OsvSlabView, OsvVectorRecord, OsvWriter, OsvWriterConfig,
 };
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::delta_buffer::{FrozenDeltaSnapshot, LsmDeltaBuffer};
+use crate::delta_buffer::{FrozenDeltaSnapshot, HybridSearchEngine, LsmDeltaBuffer};
 use crate::error::{ProEngineError, ProResult};
 use crate::manifest::{ClusterManifest, ManifestStore, SegmentDescriptor};
 use crate::wal::OspreyWal;
@@ -144,10 +144,22 @@ impl CowSlabCompactor {
         delta: &LsmDeltaBuffer,
         wal: Option<&OspreyWal>,
     ) -> ProResult<Option<CowCompactionOutcome>> {
+        self.compact_if_needed_with_engine(delta, wal, None).await
+    }
+
+    /// Checks `delta.live_count()` against `delta_flush_threshold`, compacts to S3, refreshes
+    /// `engine` from `manifest.json` if provided, and only then drains compacted entries from
+    /// `delta` and `wal`.
+    pub async fn compact_if_needed_with_engine(
+        &self,
+        delta: &LsmDeltaBuffer,
+        wal: Option<&OspreyWal>,
+        engine: Option<&HybridSearchEngine>,
+    ) -> ProResult<Option<CowCompactionOutcome>> {
         if delta.live_count()? < self.config.delta_flush_threshold {
             return Ok(None);
         }
-        self.compact_now(delta, wal).await
+        self.compact_now_with_engine(delta, wal, engine).await
     }
 
     /// Unconditionally freezes the current delta buffer via Copy-on-Write, uploads new
@@ -157,7 +169,18 @@ impl CowSlabCompactor {
         delta: &LsmDeltaBuffer,
         wal: Option<&OspreyWal>,
     ) -> ProResult<Option<CowCompactionOutcome>> {
-        let Some(snapshot) = delta.take_snapshot_for_compaction()? else {
+        self.compact_now_with_engine(delta, wal, None).await
+    }
+
+    /// Runs CoW compaction with optional immediate [`HybridSearchEngine::refresh_from_manifest`]
+    /// reload BEFORE removing compacted entries from `delta` and `wal` (zero invisibility window).
+    pub async fn compact_now_with_engine(
+        &self,
+        delta: &LsmDeltaBuffer,
+        wal: Option<&OspreyWal>,
+        engine: Option<&HybridSearchEngine>,
+    ) -> ProResult<Option<CowCompactionOutcome>> {
+        let Some(snapshot) = delta.snapshot_for_compaction()? else {
             return Ok(None);
         };
 
@@ -204,11 +227,9 @@ impl CowSlabCompactor {
         };
 
         let deleted_to_apply = snapshot.tombstones;
-        let mut upserted_set = RoaringBitmap::new();
+        let mut upserted_set = RoaringTreemap::new();
         for &doc_id in &snapshot.doc_ids {
-            if let Ok(id_u32) = u32::try_from(doc_id) {
-                upserted_set.insert(id_u32);
-            }
+            upserted_set.insert(doc_id);
         }
         let mut mask_existing = deleted_to_apply.clone();
         mask_existing |= &upserted_set;
@@ -245,7 +266,7 @@ impl CowSlabCompactor {
                         built.padded_dim,
                         self.config.fwht_seed,
                         u64::try_from(num_vectors).unwrap_or(u64::MAX),
-                        &RoaringBitmap::new(),
+                        &RoaringTreemap::new(),
                     )?;
                     manifest.segments.push(desc);
                 }
@@ -253,8 +274,16 @@ impl CowSlabCompactor {
             })
             .await?;
 
+        // Refresh the HybridSearchEngine BEFORE removing compacted vectors from delta/WAL
+        // so searches never observe an invisibility window.
+        if let Some(eng) = engine {
+            let _ = eng.refresh_from_manifest().await?;
+            eng.metrics().observe_compaction();
+        }
+
+        delta.commit_compaction_snapshot(snapshot.watermark_seq)?;
         if let Some(wal) = wal {
-            wal.reset()?;
+            wal.retain_after_seq(snapshot.watermark_seq)?;
         }
 
         Ok(Some(CowCompactionOutcome {
@@ -270,12 +299,15 @@ impl CowSlabCompactor {
         }))
     }
 
-    /// Spawns an asynchronous background compaction loop monitored by [`CompactorHandle`].
+    /// Spawns an asynchronous background compaction and optional tombstone GC loop
+    /// monitored by [`CompactorHandle`].
     #[must_use]
     pub fn spawn_background(
         self,
         delta: Arc<LsmDeltaBuffer>,
         wal: Option<Arc<OspreyWal>>,
+        engine: Arc<HybridSearchEngine>,
+        tombstone_gc: Option<TombstoneGarbageCollector>,
     ) -> CompactorHandle {
         let notify = Arc::new(Notify::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -290,8 +322,34 @@ impl CowSlabCompactor {
                 if worker_shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                if let Err(err) = self.compact_if_needed(&delta, wal.as_deref()).await {
+                if let Err(err) = self
+                    .compact_if_needed_with_engine(&delta, wal.as_deref(), Some(&engine))
+                    .await
+                {
                     tracing::warn!(error = %err, "background CoW compaction cycle failed");
+                }
+                if let Some(gc) = &tombstone_gc {
+                    if engine.loaded_segment_count().unwrap_or(0) > 0 {
+                        match gc.collect_garbage().await {
+                            Ok(report)
+                                if report.segments_rewritten > 0 || report.segments_dropped > 0 =>
+                            {
+                                engine
+                                    .metrics()
+                                    .observe_gc_reclaimed(report.tombstones_reclaimed);
+                                if let Err(err) = engine.refresh_from_manifest().await {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "failed to refresh search engine after tombstone GC"
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, "background tombstone GC cycle failed");
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -349,8 +407,8 @@ pub struct TombstoneGcReport {
     pub osv_bytes_reclaimed: u64,
 }
 
-/// Background Garbage Collector that rewrites `.osv`/`.osi` segments whose `RoaringBitmap`
-/// deletion ratio exceeds `tombstone_ratio_threshold` (default `> 20%`).
+/// Background Garbage Collector that rewrites `.osv`/`.osi` segments whose 64-bit
+/// `RoaringTreemap` deletion ratio exceeds `tombstone_ratio_threshold` (default `> 20%`).
 #[derive(Clone, Debug)]
 pub struct TombstoneGarbageCollector {
     config: TombstoneGcConfig,
@@ -379,8 +437,8 @@ impl TombstoneGarbageCollector {
         })
     }
 
-    /// Applies `deleted_doc_ids` to a segment's `RoaringBitmap` tombstones in `manifest.json`
-    /// atomically via CAS.
+    /// Applies `deleted_doc_ids` to a segment's 64-bit `RoaringTreemap` tombstones in
+    /// `manifest.json` atomically via CAS.
     pub async fn mark_tombstones_for_segment(
         &self,
         segment_id: u64,
@@ -396,9 +454,7 @@ impl TombstoneGarbageCollector {
                 {
                     let mut bm = seg.decode_tombstones()?;
                     for &doc_id in deleted_doc_ids {
-                        if let Ok(id_u32) = u32::try_from(doc_id) {
-                            bm.insert(id_u32);
-                        }
+                        bm.insert(doc_id);
                     }
                     seg.set_tombstones(&bm)?;
                 }
@@ -459,8 +515,7 @@ impl TombstoneGarbageCollector {
                 for slot in 0..count {
                     total_docs = total_docs.saturating_add(1);
                     let doc_id = page_view.doc_id(slot)?;
-                    let is_deleted =
-                        u32::try_from(doc_id).is_ok_and(|id_u32| combined.contains(id_u32));
+                    let is_deleted = combined.contains(doc_id);
                     if is_deleted {
                         deleted_docs = deleted_docs.saturating_add(1);
                         continue;
@@ -519,7 +574,8 @@ impl TombstoneGarbageCollector {
                 vectors_f32: live_vectors_f32,
                 doc_ids: live_doc_ids,
                 payloads: live_payloads,
-                tombstones: RoaringBitmap::new(),
+                tombstones: RoaringTreemap::new(),
+                watermark_seq: 0,
             };
             let built = build_segment_artifacts(
                 &live_snapshot,
@@ -573,7 +629,7 @@ impl TombstoneGarbageCollector {
                         built.padded_dim,
                         fwht_seed,
                         live_count_u64,
-                        &RoaringBitmap::new(),
+                        &RoaringTreemap::new(),
                     )?;
                     m.segments.retain(|s| s.segment_id != old_seg_id);
                     m.segments.push(new_desc);
@@ -716,4 +772,102 @@ fn next_artifact_tag() -> String {
         .map_or(0, |d| d.as_nanos());
     let seq = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
     format!("{ts}-{seq}")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use object_store::memory::InMemory;
+    use osprey_core::RawVectorRecord;
+    use osprey_storage::{
+        MinipageLruCache, RangePlannerConfig, RemoteStoreConfig, DEFAULT_MINIPAGE_CACHE_BYTES,
+    };
+
+    use super::*;
+    use crate::manifest::DEFAULT_MANIFEST_KEY;
+
+    #[tokio::test]
+    async fn compact_if_needed_with_engine_refreshes_search_immediately_without_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_store = ManifestStore::new(Arc::clone(&store), DEFAULT_MANIFEST_KEY);
+
+        let dim = 64_usize;
+        let delta = Arc::new(LsmDeltaBuffer::new(dim, dim, 101, Vec::new(), None).unwrap());
+        let engine = Arc::new(HybridSearchEngine::new(
+            Arc::clone(&delta),
+            Arc::clone(&store),
+            manifest_store.clone(),
+            Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
+            RemoteStoreConfig::default(),
+            RangePlannerConfig::default(),
+        ));
+
+        let mut vecs = Vec::new();
+        let mut payloads = Vec::new();
+        for i in 0..40_usize {
+            let mut v = vec![0.0_f32; dim];
+            v[i % dim] = 1.0;
+            v[(i + 3) % dim] = 0.2;
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v {
+                *x /= norm;
+            }
+            vecs.push(v);
+            payloads.push(format!(r#"{{"doc":{i}}}"#).into_bytes());
+        }
+        let high_doc_id = u64::MAX - 42;
+        let records: Vec<RawVectorRecord<'_>> = (0..40_usize)
+            .map(|i| RawVectorRecord {
+                doc_id: if i == 0 { high_doc_id } else { (i + 1) as u64 },
+                vector: &vecs[i],
+                payload_json: &payloads[i],
+            })
+            .collect();
+        delta.ingest_batch(&records).unwrap();
+        assert_eq!(delta.live_count().unwrap(), 40);
+
+        let compactor = CowSlabCompactor::new(
+            CompactorConfig {
+                delta_flush_threshold: 32,
+                target_clusters: 4,
+                fwht_seed: 101,
+                osv_writer_config: OsvWriterConfig {
+                    enable_zstd_dict: false,
+                    ..OsvWriterConfig::default()
+                },
+                ..CompactorConfig::default()
+            },
+            Arc::clone(&store),
+            manifest_store,
+        );
+
+        let outcome = compactor
+            .compact_if_needed_with_engine(&delta, None, Some(&engine))
+            .await
+            .unwrap()
+            .expect("compaction should trigger above threshold");
+        assert_eq!(outcome.vectors_compacted, 40);
+        assert_eq!(delta.live_count().unwrap(), 0);
+        assert_eq!(engine.loaded_segment_count().unwrap(), 1);
+
+        // Search on the same engine instance immediately finds the compacted vectors (including 64-bit doc_id)
+        let hits = engine
+            .search_hybrid_async(&vecs[0], 4, 40, 5)
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|h| h.doc_id == high_doc_id));
+        let hits_other = engine
+            .search_hybrid_async(&vecs[10], 4, 40, 5)
+            .await
+            .unwrap();
+        assert!(hits_other.iter().any(|h| h.doc_id == 11));
+
+        // Delete the 64-bit doc_id and verify 64-bit tombstone suppresses it from compacted segment
+        delta.delete_docs(&[high_doc_id]).unwrap();
+        let hits_after_delete = engine
+            .search_hybrid_async(&vecs[0], 4, 40, 40)
+            .await
+            .unwrap();
+        assert!(hits_after_delete.iter().all(|h| h.doc_id != high_doc_id));
+    }
 }

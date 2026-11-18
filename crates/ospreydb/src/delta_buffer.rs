@@ -21,7 +21,7 @@ use osprey_storage::{
     RemoteStoreConfig,
 };
 use rayon::prelude::*;
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 
 use crate::error::{ProEngineError, ProResult};
 use crate::manifest::{ClusterManifest, ManifestStore};
@@ -49,13 +49,14 @@ struct DeltaBufferState {
     codes: Vec<u64>,
     superseded: Vec<bool>,
     doc_index: HashMap<u64, usize>,
-    masked_in_base: RoaringBitmap,
-    deleted_docs: RoaringBitmap,
+    masked_in_base: RoaringTreemap,
+    deleted_docs: RoaringTreemap,
+    deleted_seq: HashMap<u64, u64>,
     live_count: usize,
     next_seq_no: u64,
 }
 
-/// Owned immutable delta snapshot extracted atomically via Copy-on-Write for compaction.
+/// Owned immutable delta snapshot extracted via Copy-on-Write for compaction.
 #[derive(Clone, Debug)]
 pub struct FrozenDeltaSnapshot {
     /// Original unpadded embedding dimensionality.
@@ -66,8 +67,10 @@ pub struct FrozenDeltaSnapshot {
     pub doc_ids: Vec<u64>,
     /// Live JSON metadata payloads aligned with `doc_ids`.
     pub payloads: Vec<Vec<u8>>,
-    /// Accumulated `RoaringBitmap` of deletions/updates to apply to older segments.
-    pub tombstones: RoaringBitmap,
+    /// Accumulated `RoaringTreemap` of deletions/updates to apply to older segments.
+    pub tombstones: RoaringTreemap,
+    /// Inclusive WAL/delta sequence watermark captured by this snapshot.
+    pub watermark_seq: u64,
 }
 
 /// Thread-safe in-memory LSM Delta Buffer backed optionally by [`OspreyWal`].
@@ -196,11 +199,11 @@ impl LsmDeltaBuffer {
         let Ok(guard) = self.state.read() else {
             return false;
         };
-        u32::try_from(doc_id).is_ok_and(|id| guard.masked_in_base.contains(id))
+        guard.masked_in_base.contains(doc_id)
     }
 
     /// Returns a cloned snapshot of all `doc_id`s tombstoned or superseded by this delta buffer.
-    pub fn masked_tombstones(&self) -> ProResult<RoaringBitmap> {
+    pub fn masked_tombstones(&self) -> ProResult<RoaringTreemap> {
         let guard = self
             .state
             .read()
@@ -227,7 +230,7 @@ impl LsmDeltaBuffer {
                     applied += 1;
                 }
                 WalOpKind::Delete => {
-                    self.delete_in_memory(&[rec.doc_id])?;
+                    self.delete_in_memory(&[rec.doc_id], Some(rec.seq_no))?;
                     applied += 1;
                 }
             }
@@ -281,7 +284,7 @@ impl LsmDeltaBuffer {
             None
         };
 
-        let last_seq = self.delete_in_memory(doc_ids)?;
+        let last_seq = self.delete_in_memory(doc_ids, wal_seq)?;
         Ok(wal_seq.unwrap_or(last_seq))
     }
 
@@ -382,10 +385,9 @@ impl LsmDeltaBuffer {
                     guard.live_count = guard.live_count.saturating_sub(1);
                 }
             }
-            if let Ok(id_u32) = u32::try_from(doc_id) {
-                guard.masked_in_base.insert(id_u32);
-                guard.deleted_docs.remove(id_u32);
-            }
+            guard.masked_in_base.insert(doc_id);
+            guard.deleted_docs.remove(doc_id);
+            guard.deleted_seq.remove(&doc_id);
             guard.entries.push(entry);
             guard.superseded.push(false);
             guard.codes.extend_from_slice(&code_words);
@@ -396,26 +398,33 @@ impl LsmDeltaBuffer {
         Ok(seq.saturating_sub(1))
     }
 
-    fn delete_in_memory(&self, doc_ids: &[u64]) -> ProResult<u64> {
+    fn delete_in_memory(&self, doc_ids: &[u64], wal_seq_end: Option<u64>) -> ProResult<u64> {
         let mut guard = self
             .state
             .write()
             .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
 
+        let mut seq = guard.next_seq_no;
+        if let Some(end_seq) = wal_seq_end {
+            let count_u64 = u64::try_from(doc_ids.len()).unwrap_or(0);
+            seq = end_seq.saturating_sub(count_u64.saturating_sub(1)).max(1);
+        }
+
         for &doc_id in doc_ids {
-            if let Ok(id_u32) = u32::try_from(doc_id) {
-                guard.masked_in_base.insert(id_u32);
-                guard.deleted_docs.insert(id_u32);
-            }
+            let cur_seq = seq;
+            seq = seq.saturating_add(1);
+            guard.masked_in_base.insert(doc_id);
+            guard.deleted_docs.insert(doc_id);
+            guard.deleted_seq.insert(doc_id, cur_seq);
             if let Some(slot) = guard.doc_index.remove(&doc_id) {
                 if !guard.superseded[slot] {
                     guard.superseded[slot] = true;
                     guard.live_count = guard.live_count.saturating_sub(1);
                 }
             }
-            guard.next_seq_no = guard.next_seq_no.saturating_add(1);
         }
-        Ok(guard.next_seq_no.saturating_sub(1))
+        guard.next_seq_no = seq;
+        Ok(seq.saturating_sub(1))
     }
 
     /// Stage-1 asymmetric `RaBitQ` search over live delta entries for an already-rotated query.
@@ -625,43 +634,35 @@ impl LsmDeltaBuffer {
         Ok(refined)
     }
 
-    /// Copy-on-Write atomic snapshot extraction for background slab compaction.
+    /// Non-destructive Copy-on-Write snapshot extraction for background slab compaction.
     ///
-    /// Swaps out the current buffer for a fresh empty state so concurrent writes proceed
-    /// without blocking. Returns `None` if there are no live entries and no tombstones.
-    pub fn take_snapshot_for_compaction(&self) -> ProResult<Option<FrozenDeltaSnapshot>> {
-        let mut guard = self
+    /// Keeps all live entries and tombstones searchable in memory until
+    /// [`Self::commit_compaction_snapshot`] is called after S3 upload, manifest CAS commit,
+    /// and `HybridSearchEngine` segment refresh succeed (eliminating any invisibility window).
+    pub fn snapshot_for_compaction(&self) -> ProResult<Option<FrozenDeltaSnapshot>> {
+        let guard = self
             .state
-            .write()
+            .read()
             .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
 
         if guard.live_count == 0 && guard.masked_in_base.is_empty() {
             return Ok(None);
         }
 
-        let prev_next_seq = guard.next_seq_no;
-        let prev = std::mem::replace(
-            &mut *guard,
-            DeltaBufferState {
-                next_seq_no: prev_next_seq,
-                ..DeltaBufferState::default()
-            },
-        );
-        drop(guard);
+        let watermark_seq = guard.next_seq_no.saturating_sub(1);
+        let mut vectors_f32 = Vec::with_capacity(guard.live_count * self.orig_dim);
+        let mut doc_ids = Vec::with_capacity(guard.live_count);
+        let mut payloads = Vec::with_capacity(guard.live_count);
 
-        let mut vectors_f32 = Vec::with_capacity(prev.live_count * self.orig_dim);
-        let mut doc_ids = Vec::with_capacity(prev.live_count);
-        let mut payloads = Vec::with_capacity(prev.live_count);
-
-        for (idx, entry) in prev.entries.into_iter().enumerate() {
-            if prev.superseded[idx] {
+        for (idx, entry) in guard.entries.iter().enumerate() {
+            if guard.superseded[idx] {
                 continue;
             }
             doc_ids.push(entry.doc_id);
-            for val in entry.vector_f16 {
+            for &val in &entry.vector_f16 {
                 vectors_f32.push(val.to_f32());
             }
-            payloads.push(entry.payload_json);
+            payloads.push(entry.payload_json.clone());
         }
 
         Ok(Some(FrozenDeltaSnapshot {
@@ -669,8 +670,77 @@ impl LsmDeltaBuffer {
             vectors_f32,
             doc_ids,
             payloads,
-            tombstones: prev.deleted_docs,
+            tombstones: guard.deleted_docs.clone(),
+            watermark_seq,
         }))
+    }
+
+    /// Commits a completed compaction up to `watermark_seq`, removing only entries and
+    /// tombstones already materialized into the S3 segment while preserving concurrent writes
+    /// that arrived with `seq_no > watermark_seq`.
+    pub fn commit_compaction_snapshot(&self, watermark_seq: u64) -> ProResult<()> {
+        let mut guard = self
+            .state
+            .write()
+            .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
+
+        let old = std::mem::take(&mut *guard);
+        guard.next_seq_no = old.next_seq_no;
+
+        let mut remaining_entries = Vec::new();
+        let mut remaining_codes = Vec::new();
+        let mut remaining_superseded = Vec::new();
+        let mut remaining_doc_index = HashMap::new();
+        let mut remaining_masked = RoaringTreemap::new();
+        let mut remaining_deleted = RoaringTreemap::new();
+        let mut remaining_deleted_seq = HashMap::new();
+        let mut remaining_live = 0_usize;
+
+        for (idx, entry) in old.entries.into_iter().enumerate() {
+            if old.superseded[idx] || entry.seq_no <= watermark_seq {
+                continue;
+            }
+            let new_slot = remaining_entries.len();
+            let doc_id = entry.doc_id;
+            remaining_doc_index.insert(doc_id, new_slot);
+            remaining_masked.insert(doc_id);
+            remaining_entries.push(entry);
+            remaining_superseded.push(false);
+            let code_start = idx * self.words_per_vec;
+            remaining_codes
+                .extend_from_slice(&old.codes[code_start..code_start + self.words_per_vec]);
+            remaining_live = remaining_live.saturating_add(1);
+        }
+
+        for (doc_id, del_seq) in old.deleted_seq {
+            if del_seq > watermark_seq {
+                remaining_masked.insert(doc_id);
+                remaining_deleted.insert(doc_id);
+                remaining_deleted_seq.insert(doc_id, del_seq);
+            }
+        }
+
+        guard.entries = remaining_entries;
+        guard.codes = remaining_codes;
+        guard.superseded = remaining_superseded;
+        guard.doc_index = remaining_doc_index;
+        guard.masked_in_base = remaining_masked;
+        guard.deleted_docs = remaining_deleted;
+        guard.deleted_seq = remaining_deleted_seq;
+        guard.live_count = remaining_live;
+        Ok(())
+    }
+
+    /// Copy-on-Write atomic snapshot extraction for background slab compaction.
+    ///
+    /// Swaps out the current buffer for a fresh empty state so concurrent writes proceed
+    /// without blocking. Returns `None` if there are no live entries and no tombstones.
+    pub fn take_snapshot_for_compaction(&self) -> ProResult<Option<FrozenDeltaSnapshot>> {
+        let Some(snapshot) = self.snapshot_for_compaction()? else {
+            return Ok(None);
+        };
+        self.commit_compaction_snapshot(snapshot.watermark_seq)?;
+        Ok(Some(snapshot))
     }
 }
 
@@ -714,7 +784,7 @@ pub struct LoadedSegment {
     /// `RefineStage` configured with `slab_id`, `RangePlannerConfig`, and optional Zstd dict.
     pub refine_stage: RefineStage,
     /// Segment-local tombstones from `manifest.json`.
-    pub tombstones: RoaringBitmap,
+    pub tombstones: RoaringTreemap,
 }
 
 /// Hybrid search coordinator combining immutable S3 `.osi`/`.osv` segments with the live
@@ -729,8 +799,9 @@ pub struct HybridSearchEngine {
     range_planner_config: RangePlannerConfig,
     simd: SimdEngine,
     segments: RwLock<Vec<Arc<LoadedSegment>>>,
-    global_tombstones: RwLock<RoaringBitmap>,
+    global_tombstones: RwLock<RoaringTreemap>,
     known_etag: RwLock<Option<String>>,
+    known_epoch: RwLock<Option<u64>>,
     metrics: Arc<ProMetricsRegistry>,
 }
 
@@ -776,8 +847,9 @@ impl HybridSearchEngine {
             range_planner_config,
             simd: SimdEngine::new_auto(),
             segments: RwLock::new(Vec::new()),
-            global_tombstones: RwLock::new(RoaringBitmap::new()),
+            global_tombstones: RwLock::new(RoaringTreemap::new()),
             known_etag: RwLock::new(None),
+            known_epoch: RwLock::new(None),
             metrics,
         }
     }
@@ -847,6 +919,18 @@ impl HybridSearchEngine {
             None => return Ok(false),
         };
 
+        // Fallback deduplication for ObjectStore backends that do not emit ETags:
+        // skip reloading segments if both epoch and segment count/ETag are unchanged.
+        if known.is_none() && snapshot.version.e_tag.is_none() {
+            let known_epoch = *self
+                .known_epoch
+                .read()
+                .map_err(|_| ProEngineError::Io(std::io::Error::other("epoch RwLock poisoned")))?;
+            if known_epoch == Some(snapshot.manifest.epoch) {
+                return Ok(false);
+            }
+        }
+
         self.apply_manifest_snapshot(&snapshot.manifest, snapshot.version.e_tag)
             .await?;
         Ok(true)
@@ -906,6 +990,13 @@ impl HybridSearchEngine {
                 .map_err(|_| ProEngineError::Io(std::io::Error::other("etag RwLock poisoned")))?;
             *etag_guard = new_etag;
         }
+        {
+            let mut epoch_guard = self
+                .known_epoch
+                .write()
+                .map_err(|_| ProEngineError::Io(std::io::Error::other("epoch RwLock poisoned")))?;
+            *epoch_guard = Some(manifest.epoch);
+        }
 
         Ok(())
     }
@@ -913,7 +1004,7 @@ impl HybridSearchEngine {
     async fn load_segment_from_store(
         &self,
         desc: &crate::manifest::SegmentDescriptor,
-        tombstones: RoaringBitmap,
+        tombstones: RoaringTreemap,
     ) -> ProResult<LoadedSegment> {
         let osi_path = ObjectPath::from(desc.osi_key.as_str());
         let osv_path = ObjectPath::from(desc.osv_key.as_str());
@@ -1020,12 +1111,9 @@ impl HybridSearchEngine {
                             top_m_per_segment,
                             simd_ref,
                             |_entry_idx, doc_id| {
-                                let Ok(id_u32) = u32::try_from(doc_id) else {
-                                    return true;
-                                };
-                                !global_tombs.contains(id_u32)
-                                    && !seg.tombstones.contains(id_u32)
-                                    && !delta_masked.contains(id_u32)
+                                !global_tombs.contains(doc_id)
+                                    && !seg.tombstones.contains(doc_id)
+                                    && !delta_masked.contains(doc_id)
                                     && !seg.osi.is_deleted(doc_id)
                             },
                         )?;
@@ -1084,10 +1172,8 @@ impl HybridSearchEngine {
         }
         for seg_hits in base_hits_nested {
             for hit in seg_hits {
-                if let Ok(id_u32) = u32::try_from(hit.doc_id) {
-                    if delta_masked.contains(id_u32) || global_tombs.contains(id_u32) {
-                        continue;
-                    }
+                if delta_masked.contains(hit.doc_id) || global_tombs.contains(hit.doc_id) {
+                    continue;
                 }
                 by_doc.entry(hit.doc_id).or_insert(hit);
             }
@@ -1210,5 +1296,69 @@ mod tests {
         delta.delete_docs(&[100]).unwrap();
         assert_eq!(delta.live_count().unwrap(), 0);
         assert!(delta.search_exact(&v1_updated, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn supports_full_64bit_doc_ids_in_tombstones_and_masking() {
+        let delta = LsmDeltaBuffer::new(64, 64, 11, Vec::new(), None).unwrap();
+        let high_id = u64::MAX - 42;
+
+        let mut vec = vec![0.0_f32; 64];
+        vec[3] = 1.0;
+
+        delta
+            .ingest_batch(&[RawVectorRecord {
+                doc_id: high_id,
+                vector: &vec,
+                payload_json: br#"{"high":true}"#,
+            }])
+            .unwrap();
+        assert!(delta.is_masked_in_base(high_id));
+        assert!(delta.masked_tombstones().unwrap().contains(high_id));
+
+        delta.delete_docs(&[high_id]).unwrap();
+        assert_eq!(delta.live_count().unwrap(), 0);
+        assert!(delta.is_masked_in_base(high_id));
+
+        let snap = delta.snapshot_for_compaction().unwrap().unwrap();
+        assert!(snap.tombstones.contains(high_id));
+    }
+
+    #[test]
+    fn commit_compaction_snapshot_preserves_concurrent_writes_after_watermark() {
+        let delta = LsmDeltaBuffer::new(64, 64, 19, Vec::new(), None).unwrap();
+        let mut v1 = vec![0.0_f32; 64];
+        v1[0] = 1.0;
+        let mut v2 = vec![0.0_f32; 64];
+        v2[1] = 1.0;
+
+        delta
+            .ingest_batch(&[RawVectorRecord {
+                doc_id: 1,
+                vector: &v1,
+                payload_json: br#"{"gen":1}"#,
+            }])
+            .unwrap();
+
+        let snap = delta.snapshot_for_compaction().unwrap().unwrap();
+        assert_eq!(snap.doc_ids, vec![1]);
+
+        // Concurrent write arrives BEFORE commit_compaction_snapshot
+        delta
+            .ingest_batch(&[RawVectorRecord {
+                doc_id: 2,
+                vector: &v2,
+                payload_json: br#"{"gen":2}"#,
+            }])
+            .unwrap();
+        assert_eq!(delta.live_count().unwrap(), 2);
+
+        delta
+            .commit_compaction_snapshot(snap.watermark_seq)
+            .unwrap();
+        assert_eq!(delta.live_count().unwrap(), 1);
+        let hits = delta.search_exact(&v2, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, 2);
     }
 }

@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
@@ -23,11 +23,23 @@ use osprey_storage::{
 use ospreydb::{
     current_unix_secs, serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder,
     EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
-    ManifestStore, OfflineLicenseVerifier, OspreyFlightService, OspreyWal, ProEngineError,
-    ProMetricsRegistry, ProResult, VectorQuotaState, WalConfig, WalRecoveryMode, WalSyncPolicy,
-    DEFAULT_ARROW_FLIGHT_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
+    ManifestStore, OfflineLicenseVerifier, OspreyFlightService, OspreyLicense, OspreyWal,
+    ProEngineError, ProMetricsRegistry, ProResult, TombstoneGarbageCollector, TombstoneGcConfig,
+    VectorQuotaState, WalConfig, WalRecoveryMode, WalSyncPolicy, DEFAULT_ARROW_FLIGHT_ADDR,
+    DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
 };
 use tokio::sync::Notify;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum NodeRole {
+    /// Single-node unified writer + reader + compactor (allowed on free Community Tier up to 5M vectors).
+    #[default]
+    Unified,
+    /// Dedicated distributed writer + compactor node (requires Pro/Enterprise license).
+    Writer,
+    /// Stateless distributed reader node polling S3 manifest.json (requires Pro/Enterprise license).
+    Reader,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -64,6 +76,9 @@ struct ServeArgs {
     #[arg(long, env = "OSPREY_PRO_LICENSE")]
     license: Option<String>,
 
+    #[arg(long, value_enum, default_value_t = NodeRole::Unified, env = "OSPREY_ROLE")]
+    role: NodeRole,
+
     #[arg(long, default_value = "default")]
     collection: String,
 
@@ -73,11 +88,21 @@ struct ServeArgs {
     #[arg(long, default_value_t = 0x4F53_5052_0001)]
     fwht_seed: u64,
 
-    #[arg(long, default_value = "./osprey.wal")]
-    wal_path: PathBuf,
+    #[arg(long, env = "OSPREY_DATA_DIR")]
+    data_dir: Option<PathBuf>,
 
-    #[arg(long, alias = "s3-manifest", env = "OSPREY_OBJECT_STORE_URI")]
+    #[arg(long, env = "OSPREY_WAL_PATH")]
+    wal_path: Option<PathBuf>,
+
+    #[arg(
+        long,
+        visible_aliases = ["s3-uri", "s3-manifest"],
+        env = "OSPREY_OBJECT_STORE_URI"
+    )]
     object_store_uri: Option<String>,
+
+    #[arg(long, default_value_t = 5, env = "OSPREY_MANIFEST_POLL_SECS")]
+    manifest_poll_secs: u64,
 
     #[arg(long, default_value = DEFAULT_ARROW_FLIGHT_ADDR)]
     flight_addr: SocketAddr,
@@ -85,11 +110,14 @@ struct ServeArgs {
     #[arg(long, default_value = DEFAULT_HTTP_ADDR)]
     http_addr: SocketAddr,
 
+    #[arg(long, env = "OSPREY_API_KEY")]
+    api_key: Option<String>,
+
     #[arg(long, default_value_t = ospreydb::DEFAULT_DELTA_FLUSH_THRESHOLD)]
     delta_flush_threshold: usize,
 
     // -- Embedder configuration (OpenAI-compatible /v1/embeddings) --
-    #[arg(long, env = "OSPREY_EMBED_URL")]
+    #[arg(long, visible_alias = "embeddings-url", env = "OSPREY_EMBED_URL")]
     embed_url: Option<String>,
 
     #[arg(
@@ -191,6 +219,46 @@ fn run_activate(args: ActivateArgs) -> ProResult<()> {
     Ok(())
 }
 
+fn validate_role_license(role: NodeRole, active_license: Option<&OspreyLicense>) -> ProResult<()> {
+    if matches!(role, NodeRole::Writer | NodeRole::Reader)
+        && active_license.is_none_or(|lic| lic.tier.eq_ignore_ascii_case("community"))
+    {
+        return Err(ProEngineError::InvalidConfig(
+            "Distributed multi-node roles (--role writer / --role reader) require an OspreyDB Pro or Enterprise license (OSPREY_PRO_LICENSE). Use --role unified for the free Community Tier (up to 5M vectors).",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_wal_path(data_dir: Option<&PathBuf>, wal_path: Option<&PathBuf>) -> PathBuf {
+    if let Some(explicit) = wal_path {
+        return explicit.clone();
+    }
+    if let Some(dir) = data_dir {
+        return dir.join("osprey.wal");
+    }
+    PathBuf::from("./osprey.wal")
+}
+
+async fn shutdown_signal() -> ProResult<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).map_err(ProEngineError::Io)?;
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                res.map_err(ProEngineError::Io)?;
+            }
+            _ = sigterm.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.map_err(ProEngineError::Io)
+    }
+}
+
 async fn run_serve(args: ServeArgs) -> ProResult<()> {
     let embedder_config = EmbedderConfig {
         embed_url: args.embed_url.unwrap_or_default(),
@@ -236,27 +304,46 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         None
     };
 
-    let padded_dim = padded_dimension(args.dim)?;
-    let (wal, replayed) = OspreyWal::open(&args.wal_path, WalConfig::default())?;
-    let wal = Arc::new(wal);
-    let delta = Arc::new(LsmDeltaBuffer::new(
-        args.dim,
-        padded_dim,
-        args.fwht_seed,
-        Vec::new(),
-        Some(Arc::clone(&wal)),
-    )?);
-    if !replayed.is_empty() {
-        let count = delta.recover_from_wal(&replayed)?;
-        tracing::info!(
-            replayed_records = count,
-            "recovered WAL state into delta buffer"
-        );
+    validate_role_license(args.role, active_license.as_ref())?;
+
+    if let Some(ref data_dir) = args.data_dir {
+        std::fs::create_dir_all(data_dir)?;
     }
+
+    let padded_dim = padded_dimension(args.dim)?;
+    let (wal, delta) = if args.role == NodeRole::Reader {
+        let delta = Arc::new(LsmDeltaBuffer::new(
+            args.dim,
+            padded_dim,
+            args.fwht_seed,
+            Vec::new(),
+            None,
+        )?);
+        (None, delta)
+    } else {
+        let wal_path = resolve_wal_path(args.data_dir.as_ref(), args.wal_path.as_ref());
+        let (wal, replayed) = OspreyWal::open(&wal_path, WalConfig::default())?;
+        let wal = Arc::new(wal);
+        let delta = Arc::new(LsmDeltaBuffer::new(
+            args.dim,
+            padded_dim,
+            args.fwht_seed,
+            Vec::new(),
+            Some(Arc::clone(&wal)),
+        )?);
+        if !replayed.is_empty() {
+            let count = delta.recover_from_wal(&replayed)?;
+            tracing::info!(
+                replayed_records = count,
+                "recovered WAL state into delta buffer"
+            );
+        }
+        (Some(wal), delta)
+    };
 
     let (store, manifest_key): (Arc<dyn ObjectStore>, String) = match &args.object_store_uri {
         Some(uri) if uri.starts_with("file://") => {
-            let local_path = uri.trim_start_matches("file://");
+            let local_path = uri.strip_prefix("file://").unwrap_or(uri.as_str());
             std::fs::create_dir_all(local_path)?;
             (
                 Arc::new(LocalFileSystem::new_with_prefix(local_path)?),
@@ -295,17 +382,31 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
     ));
     let _ = engine.refresh_from_manifest().await?;
 
-    let compactor = CowSlabCompactor::new(
-        CompactorConfig {
-            delta_flush_threshold: args.delta_flush_threshold,
-            fwht_seed: args.fwht_seed,
-            poll_interval: Duration::from_secs(2),
-            ..CompactorConfig::default()
-        },
-        store,
-        manifest_store,
-    );
-    let compactor_handle = compactor.spawn_background(Arc::clone(&delta), Some(wal));
+    let compactor_handle = if matches!(args.role, NodeRole::Unified | NodeRole::Writer) {
+        let compactor = CowSlabCompactor::new(
+            CompactorConfig {
+                delta_flush_threshold: args.delta_flush_threshold,
+                fwht_seed: args.fwht_seed,
+                poll_interval: Duration::from_secs(2),
+                ..CompactorConfig::default()
+            },
+            Arc::clone(&store),
+            manifest_store.clone(),
+        );
+        let tombstone_gc = TombstoneGarbageCollector::new(
+            TombstoneGcConfig::default(),
+            Arc::clone(&store),
+            manifest_store,
+        )?;
+        Some(compactor.spawn_background(
+            Arc::clone(&delta),
+            wal.clone(),
+            Arc::clone(&engine),
+            Some(tombstone_gc),
+        ))
+    } else {
+        None
+    };
 
     let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED)?);
     let initial_vectors = engine.total_live_vector_count()?;
@@ -320,19 +421,51 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         );
     }
 
+    let is_reader = args.role == NodeRole::Reader;
     let http_state = HttpServerState::with_quota(
         Arc::clone(&reranker),
         embedder,
         Arc::clone(&metrics),
         quota.clone(),
-    );
+    )
+    .with_api_key(args.api_key)
+    .with_read_only(is_reader);
     http_state.register_collection(&args.collection, Arc::clone(&engine))?;
 
-    let flight_service = OspreyFlightService::with_quota(engine, reranker, quota);
+    let flight_service = OspreyFlightService::with_quota(Arc::clone(&engine), reranker, quota)
+        .with_read_only(is_reader);
 
     let shutdown_notify = Arc::new(Notify::new());
     let flight_shutdown = Arc::clone(&shutdown_notify);
     let http_shutdown = Arc::clone(&shutdown_notify);
+
+    let manifest_poll_task = if matches!(args.role, NodeRole::Reader | NodeRole::Unified)
+        && args.manifest_poll_secs > 0
+    {
+        let poll_engine = Arc::clone(&engine);
+        let poll_shutdown = Arc::clone(&shutdown_notify);
+        let poll_interval = Duration::from_secs(args.manifest_poll_secs);
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = poll_shutdown.notified() => break,
+                    () = tokio::time::sleep(poll_interval) => {
+                        match poll_engine.refresh_from_manifest().await {
+                            Ok(true) => {
+                                tracing::info!("reloaded cluster manifest from object store");
+                            }
+                            Ok(false) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, "manifest polling refresh failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     let flight_task = tokio::spawn(async move {
         serve_arrow_flight(args.flight_addr, flight_service, async move {
@@ -347,12 +480,21 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         .await
     });
 
-    tokio::signal::ctrl_c().await.map_err(ProEngineError::Io)?;
+    shutdown_signal().await?;
+    tracing::info!("shutdown signal received; draining servers and flushing WAL");
     shutdown_notify.notify_waiters();
 
     let _ = flight_task.await;
     let _ = http_task.await;
-    compactor_handle.shutdown().await;
+    if let Some(handle) = manifest_poll_task {
+        let _ = handle.await;
+    }
+    if let Some(handle) = compactor_handle {
+        handle.shutdown().await;
+    }
+    if let Some(wal_ref) = wal {
+        wal_ref.sync()?;
+    }
     Ok(())
 }
 
@@ -438,5 +580,82 @@ async fn main() -> ExitCode {
             eprintln!("osprey error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn sample_pro_license() -> OspreyLicense {
+        OspreyLicense {
+            customer_org: "acme".to_owned(),
+            tier: "enterprise".to_owned(),
+            max_nodes: 0,
+            max_vectors: 0,
+            issued_at: 1_794_856_000,
+            expires_at: 1_794_856_000 + 86_400 * 365,
+            features: vec!["s3_cas_manifest".to_owned()],
+        }
+    }
+
+    #[test]
+    fn community_tier_blocks_distributed_writer_and_reader_roles() {
+        assert!(validate_role_license(NodeRole::Unified, None).is_ok());
+
+        let writer_err = validate_role_license(NodeRole::Writer, None).unwrap_err();
+        assert!(writer_err
+            .to_string()
+            .contains("Distributed multi-node roles (--role writer / --role reader)"));
+
+        let reader_err = validate_role_license(NodeRole::Reader, None).unwrap_err();
+        assert!(reader_err
+            .to_string()
+            .contains("Use --role unified for the free Community Tier"));
+
+        let pro = sample_pro_license();
+        assert!(validate_role_license(NodeRole::Writer, Some(&pro)).is_ok());
+        assert!(validate_role_license(NodeRole::Reader, Some(&pro)).is_ok());
+    }
+
+    #[test]
+    fn cli_parses_aliases_and_resolves_data_dir_wal_path() {
+        let cli = Cli::try_parse_from([
+            "osprey",
+            "serve",
+            "--data-dir",
+            "/tmp/osprey-data",
+            "--s3-uri",
+            "file:///tmp/osprey-s3",
+            "--embeddings-url",
+            "https://api.openai.com",
+            "--embed-api-key",
+            "sk-123",
+            "--api-key",
+            "secret-token",
+            "--role",
+            "reader",
+            "--manifest-poll-secs",
+            "3",
+        ])
+        .unwrap();
+
+        let Some(Command::Serve(serve)) = cli.command else {
+            panic!("expected Serve subcommand");
+        };
+        assert_eq!(serve.role, NodeRole::Reader);
+        assert_eq!(serve.manifest_poll_secs, 3);
+        assert_eq!(
+            serve.object_store_uri.as_deref(),
+            Some("file:///tmp/osprey-s3")
+        );
+        assert_eq!(serve.embed_url.as_deref(), Some("https://api.openai.com"));
+        assert_eq!(serve.embed_api_key.as_deref(), Some("sk-123"));
+        assert_eq!(serve.api_key.as_deref(), Some("secret-token"));
+        assert_eq!(
+            resolve_wal_path(serve.data_dir.as_ref(), serve.wal_path.as_ref()),
+            PathBuf::from("/tmp/osprey-data/osprey.wal")
+        );
     }
 }

@@ -169,6 +169,14 @@ impl OspreyWal {
 
             let (replayed, last_valid_offset) = replay_frames(&raw, config.recovery_mode)?;
             if last_valid_offset < raw.len() {
+                let discarded_bytes = raw.len().saturating_sub(last_valid_offset);
+                tracing::warn!(
+                    path = %path.display(),
+                    discarded_bytes,
+                    last_valid_offset,
+                    replayed_records = replayed.len(),
+                    "truncated incomplete or corrupted trailing WAL bytes during recovery"
+                );
                 let target_len =
                     u64::try_from(last_valid_offset).map_err(|_| ProEngineError::WalCorrupted {
                         offset: 0,
@@ -318,6 +326,67 @@ impl OspreyWal {
         write_wal_header(&mut guard.file)?;
         sync_file(&guard.file, self.config.sync_policy)?;
         guard.bytes_written = WAL_FILE_HEADER_BYTES as u64;
+        Ok(())
+    }
+
+    /// Truncates all WAL records with `seq_no <= watermark_seq`, preserving any concurrent
+    /// writes appended after `watermark_seq` during background compaction.
+    pub fn retain_after_seq(&self, watermark_seq: u64) -> ProResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| ProEngineError::Io(std::io::Error::other("WAL mutex poisoned")))?;
+
+        if guard.next_seq_no.saturating_sub(1) <= watermark_seq {
+            guard.file.set_len(0)?;
+            guard.file.seek(SeekFrom::Start(0))?;
+            write_wal_header(&mut guard.file)?;
+            sync_file(&guard.file, self.config.sync_policy)?;
+            guard.bytes_written = WAL_FILE_HEADER_BYTES as u64;
+            return Ok(());
+        }
+
+        let mut raw = Vec::with_capacity(usize::try_from(guard.bytes_written).unwrap_or(0));
+        guard.file.seek(SeekFrom::Start(0))?;
+        guard.file.read_to_end(&mut raw)?;
+        validate_wal_header(&raw)?;
+        let (replayed, _) = replay_frames(&raw, WalRecoveryMode::TruncateTornTail)?;
+
+        let mut buf = std::mem::take(&mut guard.scratch);
+        buf.clear();
+        for rec in replayed.into_iter().filter(|r| r.seq_no > watermark_seq) {
+            encode_wal_frame(
+                &mut buf,
+                rec.op,
+                rec.seq_no,
+                rec.doc_id,
+                &rec.vector,
+                &rec.payload_json,
+            )?;
+        }
+
+        guard.file.set_len(0)?;
+        guard.file.seek(SeekFrom::Start(0))?;
+        write_wal_header(&mut guard.file)?;
+        if !buf.is_empty() {
+            guard.file.write_all(&buf)?;
+            guard.file.flush()?;
+        }
+        sync_file(&guard.file, self.config.sync_policy)?;
+        guard.bytes_written =
+            (WAL_FILE_HEADER_BYTES as u64).saturating_add(u64::try_from(buf.len()).unwrap_or(0));
+        guard.scratch = buf;
+        Ok(())
+    }
+
+    /// Flushes and `fsync`s the WAL file descriptor (used during graceful shutdown).
+    pub fn sync(&self) -> ProResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| ProEngineError::Io(std::io::Error::other("WAL mutex poisoned")))?;
+        guard.file.flush()?;
+        guard.file.sync_all()?;
         Ok(())
     }
 }
@@ -692,6 +761,66 @@ mod tests {
         let (_, recovered) = OspreyWal::open(&path, WalConfig::default()).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].doc_id, 1);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wal_truncates_incomplete_final_frame_and_preserves_prior_records() {
+        let path = temp_wal_path("truncated_tail");
+        let _ = fs::remove_file(&path);
+
+        let valid_prefix_len: usize;
+        {
+            let (wal, _) = OspreyWal::open(&path, WalConfig::default()).unwrap();
+            let v1 = [1.0_f32; 8];
+            let v2 = [2.0_f32; 8];
+            wal.append_upserts(&[RawVectorRecord {
+                doc_id: 101,
+                vector: &v1,
+                payload_json: br#"{"k":1}"#,
+            }])
+            .unwrap();
+            valid_prefix_len = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
+            wal.append_upserts(&[RawVectorRecord {
+                doc_id: 102,
+                vector: &v2,
+                payload_json: br#"{"k":2}"#,
+            }])
+            .unwrap();
+        }
+
+        // Simulate crash mid-write of the last record by chopping off its final 15 bytes (EOF inside frame)
+        let full_len = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
+        assert!(full_len > valid_prefix_len + 15);
+        {
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len((full_len - 15) as u64).unwrap();
+        }
+
+        let (wal2, replayed) = OspreyWal::open(&path, WalConfig::default()).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].doc_id, 101);
+        assert_eq!(
+            usize::try_from(fs::metadata(&path).unwrap().len()).unwrap(),
+            valid_prefix_len
+        );
+
+        // Appending new records after recovery works cleanly
+        let v3 = [3.0_f32; 8];
+        let seq = wal2
+            .append_upserts(&[RawVectorRecord {
+                doc_id: 103,
+                vector: &v3,
+                payload_json: br#"{"k":3}"#,
+            }])
+            .unwrap();
+        assert_eq!(seq, 2);
+
+        let (_, replayed2) = OspreyWal::open(&path, WalConfig::default()).unwrap();
+        assert_eq!(replayed2.len(), 2);
+        assert_eq!(replayed2[0].doc_id, 101);
+        assert_eq!(replayed2[1].doc_id, 103);
 
         let _ = fs::remove_file(&path);
     }

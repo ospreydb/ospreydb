@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -28,6 +29,9 @@ use crate::rerank_service::LutRankReranker;
 
 pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:6333";
 
+/// Maximum HTTP JSON request body size (64 MiB) for large batch upserts.
+pub const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct HttpServerState {
     collections: Arc<RwLock<HashMap<String, Arc<HybridSearchEngine>>>>,
@@ -36,6 +40,8 @@ pub struct HttpServerState {
     metrics: Arc<ProMetricsRegistry>,
     default_nprobe: usize,
     quota: VectorQuotaState,
+    api_key: Option<String>,
+    read_only: bool,
 }
 
 impl HttpServerState {
@@ -62,7 +68,25 @@ impl HttpServerState {
             metrics,
             default_nprobe: 16,
             quota,
+            api_key: None,
+            read_only: false,
         }
+    }
+
+    /// Configures an optional static HTTP API key (`api-key` or `Authorization: Bearer`).
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty());
+        self
+    }
+
+    /// Marks this HTTP server read-only (for `--role reader` nodes), rejecting vector writes.
+    #[must_use]
+    pub const fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     pub fn register_collection(
@@ -107,19 +131,93 @@ impl HttpServerState {
 }
 
 pub fn build_http_router(state: HttpServerState) -> Router {
+    let auth_state = state.clone();
     Router::new()
         .route("/healthz", get(handle_healthz))
         .route("/metrics", get(handle_metrics))
         .route("/v1/rerank", post(handle_cohere_rerank))
         .route("/v1/embeddings", post(handle_embeddings))
         .route("/v1/license/activate", post(handle_license_activate))
+        .route("/collections", get(handle_qdrant_list_collections))
+        .route(
+            "/collections/{name}",
+            get(handle_qdrant_collection_info).put(handle_qdrant_create_collection),
+        )
+        .route("/collections/{name}/points", put(handle_qdrant_upsert))
         .route(
             "/collections/{name}/points/search",
             post(handle_qdrant_search),
         )
-        .route("/collections/{name}/points", put(handle_qdrant_upsert))
-        .route("/collections/{name}", get(handle_qdrant_collection_info))
+        .route(
+            "/collections/{name}/points/delete",
+            post(handle_qdrant_delete),
+        )
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            api_key_auth_middleware,
+        ))
         .with_state(state)
+}
+
+async fn api_key_auth_middleware(
+    State(state): State<HttpServerState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected_key) = state.api_key.as_deref() else {
+        return next.run(req).await;
+    };
+
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+
+    let provided_api_key = req
+        .headers()
+        .get("api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+
+    let provided_bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+                Some(trimmed[7..].trim())
+            } else {
+                None
+            }
+        });
+
+    let authorized = provided_api_key
+        .is_some_and(|k| constant_time_eq(k.as_bytes(), expected_key.as_bytes()))
+        || provided_bearer.is_some_and(|k| constant_time_eq(k.as_bytes(), expected_key.as_bytes()));
+
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "status": { "error": "unauthorized: valid 'api-key' or 'Authorization: Bearer' header required" }
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..max_len {
+        let ba = a.get(i).copied().unwrap_or(0);
+        let bb = b.get(i).copied().unwrap_or(0);
+        diff |= ba ^ bb;
+    }
+    diff == 0
 }
 
 pub async fn serve_http<F>(addr: SocketAddr, state: HttpServerState, shutdown: F) -> ProResult<()>
@@ -170,8 +268,14 @@ impl RerankDocumentInput {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CohereRerankRequest {
     pub model: Option<String>,
-    pub query: String,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
     pub documents: Vec<RerankDocumentInput>,
+    #[serde(default)]
+    pub query_tokens: Option<Vec<Vec<f32>>>,
+    #[serde(default)]
+    pub document_tokens: Option<Vec<Vec<Vec<f32>>>>,
     pub top_n: Option<usize>,
     pub return_documents: Option<bool>,
 }
@@ -205,20 +309,71 @@ async fn handle_cohere_rerank(
         .iter()
         .map(RerankDocumentInput::as_str)
         .collect();
-    let hits =
-        match state
-            .reranker
-            .rerank_texts(&req.query, &doc_strs, req.top_n, Some(&state.metrics))
-        {
-            Ok(hits) => hits,
-            Err(err) => {
+
+    let hits = match (&req.query_tokens, &req.document_tokens) {
+        (Some(q_toks), Some(d_toks)) => {
+            if q_toks.is_empty() {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "message": err.to_string() })),
+                    Json(json!({ "message": "query_tokens must not be empty" })),
                 )
                     .into_response();
             }
-        };
+            let q_refs: Vec<&[f32]> = q_toks.iter().map(Vec::as_slice).collect();
+            let d_refs: Vec<Vec<&[f32]>> = d_toks
+                .iter()
+                .map(|doc| doc.iter().map(Vec::as_slice).collect())
+                .collect();
+            match state.reranker.rerank_token_embeddings(
+                &q_refs,
+                &d_refs,
+                req.top_n,
+                Some(&state.metrics),
+            ) {
+                Ok(hits) => hits,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "message": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "message": "both 'query_tokens' and 'document_tokens' must be provided together"
+                })),
+            )
+                .into_response();
+        }
+        (None, None) => {
+            let Some(query) = req.query.as_deref() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "message": "either 'query' + 'documents' or 'query_tokens' + 'document_tokens' is required"
+                    })),
+                )
+                    .into_response();
+            };
+            match state
+                .reranker
+                .rerank_texts(query, &doc_strs, req.top_n, Some(&state.metrics))
+            {
+                Ok(hits) => hits,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "message": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
 
     let return_docs = req.return_documents.unwrap_or(false);
     let results: Vec<CohereRerankResultItem> = hits
@@ -227,8 +382,8 @@ async fn handle_cohere_rerank(
             index: h.index,
             relevance_score: h.relevance_score,
             document: if return_docs {
-                Some(RerankDocumentText {
-                    text: doc_strs[h.index].to_owned(),
+                doc_strs.get(h.index).map(|text| RerankDocumentText {
+                    text: (*text).to_owned(),
                 })
             } else {
                 None
@@ -421,6 +576,16 @@ async fn handle_qdrant_upsert(
     Json(req): Json<QdrantUpsertRequest>,
 ) -> Response {
     let start = std::time::Instant::now();
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": { "error": "node is running in read-only (--role reader) mode; writes are not permitted" },
+                "time": start.elapsed().as_secs_f64()
+            })),
+        )
+            .into_response();
+    }
     let engine = match state.get_collection(&collection_name) {
         Ok(Some(eng)) => eng,
         Ok(None) => {
@@ -542,6 +707,26 @@ async fn handle_qdrant_upsert(
             .into_response();
     }
 
+    let expected_dim = engine.delta_buffer().orig_dim();
+    for rec in &records {
+        if rec.vector.len() != expected_dim {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": {
+                        "error": format!(
+                            "vector dimension mismatch for point {}: expected {expected_dim}, got {}",
+                            rec.doc_id,
+                            rec.vector.len()
+                        )
+                    },
+                    "time": start.elapsed().as_secs_f64()
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let ingested_count = records.len();
     match engine.delta_buffer().ingest_batch(&records) {
         Ok(seq) => {
@@ -563,6 +748,167 @@ async fn handle_qdrant_upsert(
         }
         Err(err) => (
             StatusCode::BAD_REQUEST,
+            Json(json!({ "status": { "error": err.to_string() } })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct QdrantDeleteRequest {
+    points: Option<Vec<u64>>,
+}
+
+async fn handle_qdrant_delete(
+    State(state): State<HttpServerState>,
+    Path(collection_name): Path<String>,
+    Json(req): Json<QdrantDeleteRequest>,
+) -> Response {
+    let start = std::time::Instant::now();
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": { "error": "node is running in read-only (--role reader) mode; deletes are not permitted" },
+                "time": start.elapsed().as_secs_f64()
+            })),
+        )
+            .into_response();
+    }
+
+    let engine = match state.get_collection(&collection_name) {
+        Ok(Some(eng)) => eng,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "status": { "error": format!("Collection `{collection_name}` not found") } })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "status": { "error": err.to_string() } })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(doc_ids) = req.points else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": { "error": "'points' array of numeric IDs is required" } })),
+        )
+            .into_response();
+    };
+
+    match engine.delta_buffer().delete_docs(&doc_ids) {
+        Ok(seq) => (
+            StatusCode::OK,
+            Json(json!({
+                "result": {
+                    "operation_id": seq,
+                    "status": "completed",
+                    "deleted": doc_ids.len(),
+                },
+                "status": "ok",
+                "time": start.elapsed().as_secs_f64()
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": { "error": err.to_string() } })),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_qdrant_list_collections(State(state): State<HttpServerState>) -> Response {
+    let start = std::time::Instant::now();
+    let names: Vec<Value> = match state.collections.read() {
+        Ok(guard) => {
+            let mut keys: Vec<&String> = guard.keys().collect();
+            keys.sort();
+            keys.into_iter()
+                .map(|name| json!({ "name": name }))
+                .collect()
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "status": { "error": err.to_string() } })),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "result": {
+                "collections": names
+            },
+            "status": "ok",
+            "time": start.elapsed().as_secs_f64()
+        })),
+    )
+        .into_response()
+}
+
+async fn handle_qdrant_create_collection(
+    State(state): State<HttpServerState>,
+    Path(collection_name): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let start = std::time::Instant::now();
+    let requested_dim = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("vectors"))
+        .and_then(|v| v.get("size"))
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
+
+    match state.get_collection(&collection_name) {
+        Ok(Some(engine)) => {
+            let expected_dim = engine.delta_buffer().orig_dim();
+            if let Some(dim) = requested_dim {
+                if dim != expected_dim {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "status": {
+                                "error": format!(
+                                    "collection `{collection_name}` expects vector dimension {expected_dim}, got {dim}"
+                                )
+                            },
+                            "time": start.elapsed().as_secs_f64()
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "result": true,
+                    "status": "ok",
+                    "time": start.elapsed().as_secs_f64()
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::OK,
+            Json(json!({
+                "result": true,
+                "status": "ok",
+                "time": start.elapsed().as_secs_f64()
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "status": { "error": err.to_string() } })),
         )
             .into_response(),

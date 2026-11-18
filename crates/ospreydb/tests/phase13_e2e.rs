@@ -428,7 +428,7 @@ async fn manifest_cas_etag_conflict_retry_preserves_all_writer_segments() {
                         64,
                         worker_id.wrapping_add(1),
                         100,
-                        &roaring::RoaringBitmap::new(),
+                        &roaring::RoaringTreemap::new(),
                     )
                     .unwrap(),
                 );

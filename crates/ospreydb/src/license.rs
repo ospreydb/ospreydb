@@ -34,6 +34,10 @@ const STACK_PAYLOAD_BUF_BYTES: usize = 4096;
 /// Stack buffer capacity for 64-byte Ed25519 signature decoding.
 const STACK_SIG_BUF_BYTES: usize = 96;
 
+/// Production Ed25519 public verifying key in lowercase hexadecimal (`zero phone-home`).
+pub const OFFICIAL_PUBLIC_KEY_HEX: &str =
+    "1d8bb31d6538586926ab312a3738b0a79e3d7d246c12a0cef98681923c87a3ba";
+
 /// Statically embedded 32-byte Ed25519 public verifying key (`zero phone-home`).
 pub const EMBEDDED_PUBLIC_KEY: &[u8; 32] = include_bytes!("osprey_pro_ed25519.pub");
 
@@ -566,6 +570,36 @@ mod tests {
         let verifier = OfflineLicenseVerifier::new().unwrap();
         assert_eq!(&verifier.public_key_bytes(), EMBEDDED_PUBLIC_KEY);
         assert!(!verifier.is_enabled(ProCapability::WalStreaming));
+
+        // Verify EMBEDDED_PUBLIC_KEY matches OFFICIAL_PUBLIC_KEY_HEX byte-for-byte.
+        let mut expected = [0_u8; 32];
+        let (chunks, rem) = OFFICIAL_PUBLIC_KEY_HEX.as_bytes().as_chunks::<2>();
+        assert!(rem.is_empty());
+        for (i, chunk) in chunks.iter().enumerate() {
+            let s = std::str::from_utf8(chunk).unwrap();
+            expected[i] = u8::from_str_radix(s, 16).unwrap();
+        }
+        assert_eq!(EMBEDDED_PUBLIC_KEY, &expected);
+    }
+
+    #[test]
+    fn production_verifier_ignores_signing_key_env_override() {
+        let rogue_key = SigningKey::generate(&mut OsRng);
+        let rogue_hex = rogue_key
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        std::env::set_var("OSPREY_PRO_SIGNING_KEY", &rogue_hex);
+
+        let verifier = OfflineLicenseVerifier::new().unwrap();
+        assert_eq!(&verifier.public_key_bytes(), EMBEDDED_PUBLIC_KEY);
+
+        let now = 1_794_856_000_u64;
+        let rogue_token = sign_test_token(&rogue_key, &sample_license(now - 60, now + 3600));
+        let res = verifier.verify(&rogue_token, now);
+        std::env::remove_var("OSPREY_PRO_SIGNING_KEY");
+        assert!(matches!(res, Err(ProLicenseError::InvalidSignature)));
     }
 
     #[test]

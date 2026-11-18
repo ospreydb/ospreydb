@@ -282,7 +282,7 @@ jobs:
         if: always()
         run: rm -rf dist-docker
 
-      - name: Publish GitHub Release with binaries and SHA256SUMS
+      - name: Publish private GitHub Release with binaries and SHA256SUMS
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -292,6 +292,38 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
             dist/SHA256SUMS
+
+      - name: Publish public osprey server tarballs to ospreydb/osprey-engine release
+        env:
+          GH_TOKEN: ${{ secrets.OSPREY_ENGINE_TOKEN || secrets.OSPREY_CORE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::OSPREY_ENGINE_TOKEN / OSPREY_CORE_TOKEN not set; skipping public release upload to ospreydb/osprey-engine."
+            exit 0
+          fi
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::warning::gh CLI not installed on runner; skipping public release upload to ospreydb/osprey-engine."
+            exit 0
+          fi
+          TAG="${GITHUB_REF_NAME}"
+          (cd dist && sha256sum osprey-*.tar.gz > osprey-SHA256SUMS)
+          if gh release view "${TAG}" --repo ospreydb/osprey-engine >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              dist/osprey-*.tar.gz \
+              dist/osprey-*.tar.gz.sha256 \
+              dist/osprey-SHA256SUMS \
+              --repo ospreydb/osprey-engine \
+              --clobber
+          else
+            gh release create "${TAG}" \
+              dist/osprey-*.tar.gz \
+              dist/osprey-*.tar.gz.sha256 \
+              dist/osprey-SHA256SUMS \
+              --repo ospreydb/osprey-engine \
+              --title "OspreyDB ${TAG}" \
+              --generate-notes
+          fi
 
       - name: Show sccache statistics
         if: always()

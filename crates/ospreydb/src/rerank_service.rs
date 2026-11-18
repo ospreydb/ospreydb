@@ -198,20 +198,27 @@ fn project_text_to_token_embeddings(text: &str) -> Vec<[f32; LUTRANK_TOKEN_DIM]>
         .into_iter()
         .take(64)
         .map(|word| {
-            let lower = word.to_ascii_lowercase();
+            let lower = word.to_lowercase();
             let bytes = lower.as_bytes();
             let mut vec = [0.0_f32; LUTRANK_TOKEN_DIM];
 
-            // Exact token projection + character trigram hashing for morphological overlap.
+            // Exact token projection + Unicode character trigram hashing for morphological overlap.
             let h_word = xxh64(bytes, 0x9E37_79B9_7F4A_7C15);
             let idx_main = usize::try_from(h_word % 128).unwrap_or(0);
             vec[idx_main] += 2.0;
             let idx_sec = usize::try_from((h_word >> 16) % 128).unwrap_or(0);
             vec[idx_sec] += 1.0;
 
-            if bytes.len() >= 3 {
-                for tri in bytes.windows(3) {
-                    let h = xxh64(tri, 0xBF58_476D_1CE4_E5B9);
+            let chars: Vec<char> = lower.chars().collect();
+            if chars.len() >= 3 {
+                for tri in chars.windows(3) {
+                    let mut tri_buf = [0_u8; 12];
+                    let mut pos = 0_usize;
+                    for &ch in tri {
+                        let encoded_len = ch.encode_utf8(&mut tri_buf[pos..]).len();
+                        pos += encoded_len;
+                    }
+                    let h = xxh64(&tri_buf[..pos], 0xBF58_476D_1CE4_E5B9);
                     let dim_idx = usize::try_from(h % 128).unwrap_or(0);
                     let sign = if ((h >> 63) & 1) == 0 { 1.0 } else { -1.0 };
                     vec[dim_idx] += 0.5 * sign;
@@ -264,5 +271,20 @@ mod tests {
         assert_eq!(hits[0].index, 1);
         assert!(hits[0].relevance_score > hits[1].relevance_score);
         assert!(metrics.snapshot().lutrank_tokens_total > 0);
+    }
+
+    #[test]
+    fn lutrank_reranker_handles_unicode_accented_text_case_insensitively() {
+        let reranker = LutRankReranker::new(DEFAULT_LUTRANK_SEED).unwrap();
+        let docs = [
+            "receita de bolo de chocolate com baunilha",
+            "BUSCA SEMÂNTICA VETORIAL EM PRODUÇÃO COM ACENTUAÇÃO",
+            "configuração de rede local sem fio",
+        ];
+        let hits = reranker
+            .rerank_texts("busca semântica em produção", &docs, Some(3), None)
+            .unwrap();
+        assert_eq!(hits[0].index, 1);
+        assert!(hits[0].relevance_score > hits[1].relevance_score);
     }
 }

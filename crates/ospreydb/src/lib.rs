@@ -39,7 +39,7 @@ pub use license::{
     capability_from_str, capability_name, current_unix_secs, Ed25519LicenseVerifier,
     OfflineLicenseVerifier, OspreyLicense, VectorQuotaState, COMMUNITY_MAX_VECTORS,
     EMBEDDED_PUBLIC_KEY, LICENSE_GRACE_PERIOD_SECS, LICENSE_TOKEN_PREFIX, MAX_CLOCK_SKEW_SECS,
-    MAX_LICENSE_TOKEN_BYTES,
+    MAX_LICENSE_TOKEN_BYTES, OFFICIAL_PUBLIC_KEY_HEX,
 };
 pub use manifest::{
     ClusterManifest, ManifestSnapshot, ManifestStore, SegmentDescriptor, DEFAULT_MANIFEST_KEY,

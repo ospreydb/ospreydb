@@ -9,7 +9,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutPayload, UpdateVersion};
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ProEngineError, ProResult};
@@ -37,14 +37,14 @@ pub struct SegmentDescriptor {
     pub fwht_seed: u64,
     /// Total vector count stored in this segment when built.
     pub num_vectors: u64,
-    /// Portable `RoaringBitmap` bytes (Base64-encoded) of tombstoned `doc_id`s in this segment.
+    /// Portable `RoaringTreemap` bytes (Base64-encoded) of tombstoned 64-bit `doc_id`s in this segment.
     pub tombstones_b64: String,
     /// Cached tombstone cardinality for fast GC ratio checks.
     pub tombstone_count: u64,
 }
 
 impl SegmentDescriptor {
-    /// Creates a new [`SegmentDescriptor`] with an optional initial tombstone bitmap.
+    /// Creates a new [`SegmentDescriptor`] with an optional initial tombstone treemap.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         segment_id: u64,
@@ -54,7 +54,7 @@ impl SegmentDescriptor {
         padded_dim: u16,
         fwht_seed: u64,
         num_vectors: u64,
-        tombstones: &RoaringBitmap,
+        tombstones: &RoaringTreemap,
     ) -> ProResult<Self> {
         let mut desc = Self {
             segment_id,
@@ -71,13 +71,13 @@ impl SegmentDescriptor {
         Ok(desc)
     }
 
-    /// Decodes the segment's [`RoaringBitmap`] of tombstones.
-    pub fn decode_tombstones(&self) -> ProResult<RoaringBitmap> {
+    /// Decodes the segment's 64-bit [`RoaringTreemap`] of tombstones.
+    pub fn decode_tombstones(&self) -> ProResult<RoaringTreemap> {
         decode_roaring_b64(&self.tombstones_b64)
     }
 
-    /// Encodes and updates the segment's [`RoaringBitmap`] of tombstones.
-    pub fn set_tombstones(&mut self, bitmap: &RoaringBitmap) -> ProResult<()> {
+    /// Encodes and updates the segment's 64-bit [`RoaringTreemap`] of tombstones.
+    pub fn set_tombstones(&mut self, bitmap: &RoaringTreemap) -> ProResult<()> {
         self.tombstones_b64 = encode_roaring_b64(bitmap)?;
         self.tombstone_count = bitmap.len();
         Ok(())
@@ -110,7 +110,7 @@ pub struct ClusterManifest {
     pub next_segment_id: u64,
     /// Active immutable segments visible to stateless reader nodes.
     pub segments: Vec<SegmentDescriptor>,
-    /// Global `RoaringBitmap` (Base64-encoded) of logically deleted `doc_id`s across segments.
+    /// Global `RoaringTreemap` (Base64-encoded) of logically deleted 64-bit `doc_id`s across segments.
     pub global_tombstones_b64: String,
 }
 
@@ -141,19 +141,19 @@ impl ClusterManifest {
         id
     }
 
-    /// Decodes the cluster-wide global tombstone [`RoaringBitmap`].
-    pub fn decode_global_tombstones(&self) -> ProResult<RoaringBitmap> {
+    /// Decodes the cluster-wide global tombstone [`RoaringTreemap`].
+    pub fn decode_global_tombstones(&self) -> ProResult<RoaringTreemap> {
         decode_roaring_b64(&self.global_tombstones_b64)
     }
 
-    /// Updates the cluster-wide global tombstone [`RoaringBitmap`].
-    pub fn set_global_tombstones(&mut self, bitmap: &RoaringBitmap) -> ProResult<()> {
+    /// Updates the cluster-wide global tombstone [`RoaringTreemap`].
+    pub fn set_global_tombstones(&mut self, bitmap: &RoaringTreemap) -> ProResult<()> {
         self.global_tombstones_b64 = encode_roaring_b64(bitmap)?;
         Ok(())
     }
 
     /// Returns the union of segment-local and global tombstones for `seg`.
-    pub fn combined_tombstones_for(&self, seg: &SegmentDescriptor) -> ProResult<RoaringBitmap> {
+    pub fn combined_tombstones_for(&self, seg: &SegmentDescriptor) -> ProResult<RoaringTreemap> {
         let mut combined = seg.decode_tombstones()?;
         let global = self.decode_global_tombstones()?;
         combined |= &global;
@@ -334,7 +334,7 @@ impl ManifestStore {
     }
 }
 
-fn encode_roaring_b64(bitmap: &RoaringBitmap) -> ProResult<String> {
+fn encode_roaring_b64(bitmap: &RoaringTreemap) -> ProResult<String> {
     if bitmap.is_empty() {
         return Ok(String::new());
     }
@@ -343,12 +343,12 @@ fn encode_roaring_b64(bitmap: &RoaringBitmap) -> ProResult<String> {
     Ok(STANDARD.encode(bytes))
 }
 
-fn decode_roaring_b64(b64: &str) -> ProResult<RoaringBitmap> {
+fn decode_roaring_b64(b64: &str) -> ProResult<RoaringTreemap> {
     if b64.is_empty() {
-        return Ok(RoaringBitmap::new());
+        return Ok(RoaringTreemap::new());
     }
     let raw = STANDARD.decode(b64)?;
-    let bitmap = RoaringBitmap::deserialize_from(&raw[..])?;
+    let bitmap = RoaringTreemap::deserialize_from(&raw[..])?;
     Ok(bitmap)
 }
 
@@ -402,7 +402,7 @@ mod tests {
                 64,
                 42,
                 1000,
-                &RoaringBitmap::new(),
+                &RoaringTreemap::new(),
             )
             .unwrap(),
         );
@@ -456,7 +456,7 @@ mod tests {
                         64,
                         worker_id + 1,
                         100,
-                        &RoaringBitmap::new(),
+                        &RoaringTreemap::new(),
                     )?);
                     Ok(())
                 })

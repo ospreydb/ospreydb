@@ -98,7 +98,7 @@ impl Embedder {
     #[must_use]
     pub fn new(config: EmbedderConfig) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(15))
             .pool_max_idle_per_host(MAX_CONCURRENT_REQUESTS)
             .build()
             .unwrap_or_else(|_| Client::new());

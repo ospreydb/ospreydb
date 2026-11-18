@@ -239,6 +239,14 @@ async fn background_compactor_and_tombstone_gc_rewrite_slabs_above_20_percent() 
 
     let dim = 64_usize;
     let delta = Arc::new(LsmDeltaBuffer::new(dim, dim, 777, Vec::new(), None).unwrap());
+    let writer_engine = Arc::new(HybridSearchEngine::new(
+        Arc::clone(&delta),
+        Arc::clone(&store),
+        manifest_store.clone(),
+        Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
+        RemoteStoreConfig::default(),
+        RangePlannerConfig::default(),
+    ));
 
     let compactor = CowSlabCompactor::new(
         CompactorConfig {
@@ -256,7 +264,8 @@ async fn background_compactor_and_tombstone_gc_rewrite_slabs_above_20_percent() 
         manifest_store.clone(),
     );
 
-    let handle = compactor.spawn_background(Arc::clone(&delta), None);
+    let handle =
+        compactor.spawn_background(Arc::clone(&delta), None, Arc::clone(&writer_engine), None);
 
     let vecs: Vec<Vec<f32>> = (0..100)
         .map(|i| make_unit_basis_vector(dim, i % dim, (i + 7) % dim, 0.2))
@@ -288,6 +297,12 @@ async fn background_compactor_and_tombstone_gc_rewrite_slabs_above_20_percent() 
     }
     handle.shutdown().await;
     assert!(flushed, "background compactor did not materialize segment");
+    assert_eq!(writer_engine.loaded_segment_count().unwrap(), 1);
+    let post_compact_hits = writer_engine
+        .search_hybrid_async(&vecs[49], 4, 100, 5)
+        .await
+        .unwrap();
+    assert!(post_compact_hits.iter().any(|h| h.doc_id == 50));
 
     let snap = manifest_store.load().await.unwrap().unwrap();
     assert_eq!(snap.manifest.segments.len(), 1);
