@@ -1,7 +1,10 @@
 //! Safe SIMD backend trait, portable `ScalarBackend`, and runtime `SimdEngine` dispatcher.
 
 use half::f16;
-use osprey_core::{dot_f32_f16_scalar, OspreyError, OspreyResult};
+use osprey_core::{
+    dot_f32_f16_scalar, rabitq_4bit_fastscan_block_scalar, OspreyError, OspreyResult,
+    FASTSCAN_BLOCK_SIZE,
+};
 
 use crate::detect::{detect_best_simd_level, is_f16c_supported, is_level_supported, SimdLevel};
 
@@ -101,6 +104,32 @@ pub trait SimdBackend: Send + Sync + 'static {
     fn dot_f32_f16(&self, a_f32: &[f32], b_f16: &[f16]) -> f32 {
         dot_f32_f16_scalar(a_f32, b_f16)
     }
+
+    /// Phase 6 (4-bit FastScan): Evaluates one transposed 32-vector 4-bit `RaBitQ` block
+    /// against `[padded_dim * 16]` `u8` query lookup tables (`vpshufb`).
+    #[inline]
+    fn rabitq_4bit_fastscan_block(
+        &self,
+        q_lut_u8: &[u8],
+        padded_dim: usize,
+        block_bytes: &[u8],
+        out_sums: &mut [u32; FASTSCAN_BLOCK_SIZE],
+    ) {
+        rabitq_4bit_fastscan_block_scalar(q_lut_u8, padded_dim, block_bytes, out_sums);
+    }
+
+    /// Computes `argmin_c (0.5 * ||c||^2 - <q, c>)` across a batch of `f32` queries.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_nearest_centroid_l2_f32(
+        &self,
+        queries: &[f32],
+        num_queries: usize,
+        centroids: &[f32],
+        centroid_half_norm_sq: &[f32],
+        dim: usize,
+        num_centroids: usize,
+        out_clusters: &mut [u32],
+    );
 }
 
 impl osprey_core::cluster::BinaryKMeansKernel for SimdEngine {
@@ -185,6 +214,17 @@ impl osprey_core::rabitq::RabitqScanKernel for ScalarBackend {
     }
 
     #[inline]
+    fn rabitq_4bit_fastscan_block(
+        &self,
+        q_lut_u8: &[u8],
+        padded_dim: usize,
+        block_bytes: &[u8],
+        out_sums: &mut [u32; FASTSCAN_BLOCK_SIZE],
+    ) {
+        SimdBackend::rabitq_4bit_fastscan_block(self, q_lut_u8, padded_dim, block_bytes, out_sums);
+    }
+
+    #[inline]
     fn dot_f32_f16(&self, a_f32: &[f32], b_f16: &[f16]) -> f32 {
         SimdBackend::dot_f32_f16(self, a_f32, b_f16)
     }
@@ -212,6 +252,61 @@ impl osprey_core::rabitq::RabitqScanKernel for SimdEngine {
         db_bits: &[u64],
     ) -> i32 {
         SimdBackend::rabitq_4bit_dot_u64(self, query_planes, query_signs, query_abs_sum, db_bits)
+    }
+
+    #[inline]
+    fn rabitq_1bit_batch_dots_u64(
+        &self,
+        query_planes: &[[u64; 4]],
+        query_signs: &[u64],
+        query_abs_sum: i32,
+        db_words_contiguous: &[u64],
+        words_per_vec: usize,
+        out_dots: &mut [i32],
+    ) {
+        match self.level {
+            #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+            SimdLevel::Avx512 if words_per_vec >= 8 && is_level_supported(SimdLevel::Avx512) => {
+                // SAFETY: `is_level_supported(Avx512)` confirmed `avx512f` and `avx512vpopcntdq`.
+                unsafe {
+                    crate::avx512::rabitq_1bit_batch_dots_u64_avx512(
+                        query_planes,
+                        query_signs,
+                        query_abs_sum,
+                        db_words_contiguous,
+                        words_per_vec,
+                        out_dots,
+                    );
+                }
+            }
+            _ => {
+                if words_per_vec == 0 {
+                    out_dots.fill(0);
+                    return;
+                }
+                for (idx, dst) in out_dots.iter_mut().enumerate() {
+                    let start = idx * words_per_vec;
+                    *dst = SimdBackend::rabitq_4bit_dot_u64(
+                        self,
+                        query_planes,
+                        query_signs,
+                        query_abs_sum,
+                        &db_words_contiguous[start..start + words_per_vec],
+                    );
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn rabitq_4bit_fastscan_block(
+        &self,
+        q_lut_u8: &[u8],
+        padded_dim: usize,
+        block_bytes: &[u8],
+        out_sums: &mut [u32; FASTSCAN_BLOCK_SIZE],
+    ) {
+        SimdBackend::rabitq_4bit_fastscan_block(self, q_lut_u8, padded_dim, block_bytes, out_sums);
     }
 
     #[inline]
@@ -566,6 +661,43 @@ impl SimdBackend for ScalarBackend {
         #[allow(clippy::cast_precision_loss)]
         {
             (acc_l1 as f32) * scale1 + (acc_l2 as f32) * scale2
+        }
+    }
+
+    fn batch_nearest_centroid_l2_f32(
+        &self,
+        queries: &[f32],
+        num_queries: usize,
+        centroids: &[f32],
+        centroid_half_norm_sq: &[f32],
+        dim: usize,
+        num_centroids: usize,
+        out_clusters: &mut [u32],
+    ) {
+        if num_queries == 0 || dim == 0 || num_centroids == 0 {
+            return;
+        }
+        let valid_q = num_queries.min(queries.len() / dim).min(out_clusters.len());
+        let valid_c = num_centroids
+            .min(centroids.len() / dim)
+            .min(centroid_half_norm_sq.len());
+        for q_idx in 0..valid_q {
+            let q = &queries[q_idx * dim..(q_idx + 1) * dim];
+            let mut best_c = 0usize;
+            let mut best_score = f32::INFINITY;
+            for c in 0..valid_c {
+                let cen = &centroids[c * dim..(c + 1) * dim];
+                let mut dot = 0.0_f32;
+                for (&qv, &cv) in q.iter().zip(cen.iter()) {
+                    dot += qv * cv;
+                }
+                let score = centroid_half_norm_sq[c] - dot;
+                if score < best_score {
+                    best_score = score;
+                    best_c = c;
+                }
+            }
+            out_clusters[q_idx] = u32::try_from(best_c).unwrap_or(0);
         }
     }
 }
@@ -935,6 +1067,114 @@ impl SimdBackend for SimdEngine {
                 unsafe { crate::avx2::dot_f32_f16_avx2(a_f32, b_f16) }
             }
             _ => dot_f32_f16_scalar(a_f32, b_f16),
+        }
+    }
+
+    #[inline]
+    fn rabitq_4bit_fastscan_block(
+        &self,
+        q_lut_u8: &[u8],
+        padded_dim: usize,
+        block_bytes: &[u8],
+        out_sums: &mut [u32; FASTSCAN_BLOCK_SIZE],
+    ) {
+        match self.level {
+            #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+            SimdLevel::Avx512 if padded_dim >= 4 && is_level_supported(SimdLevel::Avx512) => {
+                // SAFETY: `is_level_supported(Avx512)` confirmed `avx512f` and `avx512bw`.
+                unsafe {
+                    crate::avx512::rabitq_4bit_fastscan_block_avx512(
+                        q_lut_u8,
+                        padded_dim,
+                        block_bytes,
+                        out_sums,
+                    );
+                }
+            }
+            #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+            SimdLevel::Avx2 | SimdLevel::Avx512
+                if padded_dim >= 2 && is_level_supported(SimdLevel::Avx2) =>
+            {
+                // SAFETY: `is_level_supported(Avx2)` confirmed `avx2`.
+                unsafe {
+                    crate::avx2::rabitq_4bit_fastscan_block_avx2(
+                        q_lut_u8,
+                        padded_dim,
+                        block_bytes,
+                        out_sums,
+                    );
+                }
+            }
+            _ => {
+                ScalarBackend.rabitq_4bit_fastscan_block(
+                    q_lut_u8,
+                    padded_dim,
+                    block_bytes,
+                    out_sums,
+                );
+            }
+        }
+    }
+
+    fn batch_nearest_centroid_l2_f32(
+        &self,
+        queries: &[f32],
+        num_queries: usize,
+        centroids: &[f32],
+        centroid_half_norm_sq: &[f32],
+        dim: usize,
+        num_centroids: usize,
+        out_clusters: &mut [u32],
+    ) {
+        if num_queries == 0 || dim == 0 || num_centroids == 0 {
+            return;
+        }
+        let valid_q = num_queries.min(queries.len() / dim).min(out_clusters.len());
+        let valid_c = num_centroids
+            .min(centroids.len() / dim)
+            .min(centroid_half_norm_sq.len());
+        match self.level {
+            #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+            SimdLevel::Avx512 if dim >= 16 && is_level_supported(SimdLevel::Avx512) => {
+                // SAFETY: `is_level_supported(Avx512)` confirmed `avx512f` and `fma` support.
+                unsafe {
+                    crate::avx512::batch_nearest_centroid_l2_f32_avx512(
+                        queries,
+                        valid_q,
+                        centroids,
+                        centroid_half_norm_sq,
+                        dim,
+                        valid_c,
+                        out_clusters,
+                    );
+                }
+            }
+            #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+            SimdLevel::Avx2 | SimdLevel::Avx512
+                if dim >= 8 && is_level_supported(SimdLevel::Avx2) =>
+            {
+                // SAFETY: `is_level_supported(Avx2)` confirmed `avx2` and `fma` support.
+                unsafe {
+                    crate::avx2::batch_nearest_centroid_l2_f32_avx2(
+                        queries,
+                        valid_q,
+                        centroids,
+                        centroid_half_norm_sq,
+                        dim,
+                        valid_c,
+                        out_clusters,
+                    );
+                }
+            }
+            _ => ScalarBackend.batch_nearest_centroid_l2_f32(
+                queries,
+                valid_q,
+                centroids,
+                centroid_half_norm_sq,
+                dim,
+                valid_c,
+                out_clusters,
+            ),
         }
     }
 }
@@ -1500,6 +1740,156 @@ mod tests {
             }
             let auto_got = crate::dot_f32_f16(&a, &b);
             assert!((auto_got - expected).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn rabitq_4bit_fastscan_all_backends_match_scalar() {
+        use osprey_core::math::SplitMix64;
+
+        let backends = supported_backends();
+        let scalar = SimdEngine::with_level(SimdLevel::Scalar);
+        let mut rng = SplitMix64::new(0x4B17_FA57_5CA4);
+
+        for padded_dim in [64usize, 128, 256, 512, 1024] {
+            let lut: Vec<u8> = (0..(padded_dim * 16))
+                .map(|_| (rng.next_u64() & 0xFF) as u8)
+                .collect();
+            let block: Vec<u8> = (0..(padded_dim * 16))
+                .map(|_| (rng.next_u64() & 0xFF) as u8)
+                .collect();
+
+            let mut expected = [0_u32; FASTSCAN_BLOCK_SIZE];
+            scalar.rabitq_4bit_fastscan_block(&lut, padded_dim, &block, &mut expected);
+
+            for engine in &backends {
+                let mut got = [0_u32; FASTSCAN_BLOCK_SIZE];
+                engine.rabitq_4bit_fastscan_block(&lut, padded_dim, &block, &mut got);
+                assert_eq!(
+                    got,
+                    expected,
+                    "fastscan mismatch dim={padded_dim} level={:?}",
+                    engine.active_level()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_nearest_centroid_l2_f32_all_backends_match_scalar() {
+        use osprey_core::math::SplitMix64;
+
+        let backends = supported_backends();
+        let scalar = SimdEngine::with_level(SimdLevel::Scalar);
+        let mut rng = SplitMix64::new(0xCE47_01D5_4321);
+
+        for (nq, nc, dim) in [(17usize, 37usize, 128usize), (35, 69, 1024), (9, 5, 67)] {
+            let mut queries = Vec::with_capacity(nq * dim);
+            let mut centroids = Vec::with_capacity(nc * dim);
+            for _ in 0..(nq * dim) {
+                let r = ((rng.next_u64() >> 11) as f64) / ((1_u64 << 53) as f64) * 2.0 - 1.0;
+                #[allow(clippy::cast_possible_truncation)]
+                queries.push(r as f32);
+            }
+            for _ in 0..(nc * dim) {
+                let r = ((rng.next_u64() >> 11) as f64) / ((1_u64 << 53) as f64) * 2.0 - 1.0;
+                #[allow(clippy::cast_possible_truncation)]
+                centroids.push(r as f32);
+            }
+            let half_norm_sq: Vec<f32> = (0..nc)
+                .map(|c| {
+                    let slice = &centroids[c * dim..(c + 1) * dim];
+                    let sq: f32 = slice.iter().map(|&x| x * x).sum();
+                    0.5 * sq
+                })
+                .collect();
+
+            let mut expected = vec![0_u32; nq];
+            scalar.batch_nearest_centroid_l2_f32(
+                &queries,
+                nq,
+                &centroids,
+                &half_norm_sq,
+                dim,
+                nc,
+                &mut expected,
+            );
+
+            for engine in &backends {
+                let mut got = vec![0_u32; nq];
+                engine.batch_nearest_centroid_l2_f32(
+                    &queries,
+                    nq,
+                    &centroids,
+                    &half_norm_sq,
+                    dim,
+                    nc,
+                    &mut got,
+                );
+                assert_eq!(
+                    got,
+                    expected,
+                    "batch_nearest_centroid mismatch nq={nq} nc={nc} dim={dim} level={:?}",
+                    engine.active_level()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rabitq_1bit_batch_dots_u64_all_backends_match_scalar() {
+        use osprey_core::math::SplitMix64;
+        use osprey_core::rabitq::RabitqScanKernel;
+
+        let backends = supported_backends();
+        let scalar = SimdEngine::with_level(SimdLevel::Scalar);
+        let mut rng = SplitMix64::new(0xBA7C_1B17_9876);
+
+        for words_per_vec in [4usize, 8, 16] {
+            let count = 33usize;
+            let q_planes: Vec<[u64; 4]> = (0..words_per_vec)
+                .map(|_| {
+                    [
+                        rng.next_u64(),
+                        rng.next_u64(),
+                        rng.next_u64(),
+                        rng.next_u64(),
+                    ]
+                })
+                .collect();
+            let q_signs: Vec<u64> = (0..words_per_vec).map(|_| rng.next_u64()).collect();
+            let db: Vec<u64> = (0..(count * words_per_vec))
+                .map(|_| rng.next_u64())
+                .collect();
+            let q_abs = 1234_i32;
+
+            let mut expected = vec![0_i32; count];
+            scalar.rabitq_1bit_batch_dots_u64(
+                &q_planes,
+                &q_signs,
+                q_abs,
+                &db,
+                words_per_vec,
+                &mut expected,
+            );
+
+            for engine in &backends {
+                let mut got = vec![0_i32; count];
+                engine.rabitq_1bit_batch_dots_u64(
+                    &q_planes,
+                    &q_signs,
+                    q_abs,
+                    &db,
+                    words_per_vec,
+                    &mut got,
+                );
+                assert_eq!(
+                    got,
+                    expected,
+                    "batch_dots mismatch wpv={words_per_vec} level={:?}",
+                    engine.active_level()
+                );
+            }
         }
     }
 }

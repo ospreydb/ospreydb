@@ -45,6 +45,7 @@ struct OsiInspectReport {
     file_size_bytes: u64,
     version: u16,
     flags: u8,
+    rabitq_bits: u8,
     orig_dim: u16,
     padded_dim: u16,
     num_centroids: u32,
@@ -251,6 +252,7 @@ fn inspect_osi(
         file_size_bytes,
         version: hdr.version,
         flags: hdr.flags,
+        rabitq_bits: hdr.rabitq_bits(),
         orig_dim: hdr.orig_dim,
         padded_dim: hdr.padded_dim,
         num_centroids: hdr.num_clusters,
@@ -506,7 +508,10 @@ fn print_osi_human(r: &OsiInspectReport) {
     print_kv("File size", &format_bytes(r.file_size_bytes));
     print_kv(
         "Dimensions",
-        &format!("orig_dim={} -> padded_dim={}", r.orig_dim, r.padded_dim),
+        &format!(
+            "orig_dim={} -> padded_dim={} ({}-bit RaBitQ)",
+            r.orig_dim, r.padded_dim, r.rabitq_bits
+        ),
     );
     print_kv("Centroids (K)", &paint_accent(&r.num_centroids.to_string()));
     print_kv("Vectors (N)", &paint_accent(&r.num_vectors.to_string()));

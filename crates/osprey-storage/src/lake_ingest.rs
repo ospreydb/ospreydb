@@ -22,10 +22,8 @@ use half::f16;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use osprey_core::math::{padded_dimension, prepare_and_pad_vector, RademacherSigns, SplitMix64};
-use osprey_core::{
-    fit_binary_kmeans, BinaryKMeansConfig, BinaryKMeansKernel, OspreyError, OspreyResult,
-    ScalarClusterKernel,
-};
+use osprey_core::{fit_binary_kmeans, BinaryKMeansConfig, OspreyError, OspreyResult};
+use osprey_simd::{SimdBackend, SimdEngine};
 use parquet::arrow::arrow_reader::{
     ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
@@ -34,6 +32,7 @@ use parquet::arrow::async_reader::{
 };
 use parquet::arrow::ProjectionMask;
 use parquet::file::reader::ChunkReader;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use xxhash_rust::xxh64::xxh64;
 
@@ -2082,6 +2081,8 @@ pub struct TrainedLakeCodebook {
     pub centroids_f16: Vec<f16>,
     /// Pre-promoted `f32` copy of `centroids_f16` for fast Pass-2 assignment.
     centroids_f32: Vec<f32>,
+    /// Precomputed `0.5 * ||centroid||^2` terms for L2 argmin `0.5*||c||^2 - <q, c>`.
+    centroid_half_norm_sq: Vec<f32>,
     /// Precomputed Rademacher sign XOR masks for FWHT rotation.
     xor_masks: Vec<u32>,
     /// Bidirectional logical <-> TSP physical cluster permutation.
@@ -2216,36 +2217,147 @@ impl OutOfCoreIngestPipeline {
         }
         let k = self.config.num_clusters.max(1).min(sample_count);
         let sk_config = BinaryKMeansConfig::new(k);
+        let simd = SimdEngine::new_auto();
         let km = fit_binary_kmeans(
             samples_f32,
             sample_count,
             orig_dim,
             self.config.fwht_seed,
             &sk_config,
-            &ScalarClusterKernel,
+            &simd,
         )?;
 
         let padded_dim = padded_dimension(orig_dim)?;
+        let signs = RademacherSigns::from_seed(padded_dim, self.config.fwht_seed)?;
+        let xor_masks = signs.xor_masks().to_vec();
+
+        // Refine 1-bit Binary K-Means centroids with 5 SIMD Spherical/L2 Lloyd iterations on the
+        // rotated training subsample so IVF routing (`probe_clusters` dot product) is sharp even
+        // on high-dimensional anisotropic datasets without hurting small-K unit test speed.
+        let mut refined_centroids: Vec<f32> = km.centroids_f16.iter().map(|v| v.to_f32()).collect();
         let mut counts = vec![0_u64; k];
-        for &cid in &km.assignments {
-            if let Ok(idx) = usize::try_from(cid) {
-                if let Some(c) = counts.get_mut(idx) {
-                    *c += 1;
+        if sample_count >= k && k >= 16 {
+            let mut rot_samples = vec![0.0_f32; sample_count * padded_dim];
+            rot_samples
+                .par_chunks_mut(256 * padded_dim)
+                .enumerate()
+                .try_for_each(|(chunk_idx, dst_chunk)| -> OspreyResult<()> {
+                    let row_start = chunk_idx * 256;
+                    let rows = dst_chunk.len() / padded_dim;
+                    for r in 0..rows {
+                        let src = &samples_f32
+                            [(row_start + r) * orig_dim..(row_start + r + 1) * orig_dim];
+                        let dst = &mut dst_chunk[r * padded_dim..(r + 1) * padded_dim];
+                        prepare_and_pad_vector(src, dst)?;
+                        SimdBackend::fwht_rotate_in_place(&simd, dst, &xor_masks)?;
+                    }
+                    Ok(())
+                })?;
+
+            let mut sample_assigns = vec![0_u32; sample_count];
+            for _iter in 0..12 {
+                let hn_sq: Vec<f32> = (0..k)
+                    .map(|c| {
+                        let s = &refined_centroids[c * padded_dim..(c + 1) * padded_dim];
+                        0.5_f32 * s.iter().map(|&x| x * x).sum::<f32>()
+                    })
+                    .collect();
+                rot_samples
+                    .par_chunks(256 * padded_dim)
+                    .zip(sample_assigns.par_chunks_mut(256))
+                    .for_each(|(r_chunk, a_chunk)| {
+                        simd.batch_nearest_centroid_l2_f32(
+                            r_chunk,
+                            a_chunk.len(),
+                            &refined_centroids,
+                            &hn_sq,
+                            padded_dim,
+                            k,
+                            a_chunk,
+                        );
+                    });
+
+                let (sums, new_counts) = rot_samples
+                    .par_chunks(1024 * padded_dim)
+                    .zip(sample_assigns.par_chunks(1024))
+                    .fold(
+                        || (vec![0.0_f64; k * padded_dim], vec![0_u64; k]),
+                        |(mut acc_s, mut acc_c), (r_chunk, a_chunk)| {
+                            for (r, &cid) in a_chunk.iter().enumerate() {
+                                let c = usize::try_from(cid).unwrap_or(0);
+                                if c < k {
+                                    acc_c[c] += 1;
+                                    let src = &r_chunk[r * padded_dim..(r + 1) * padded_dim];
+                                    let dst = &mut acc_s[c * padded_dim..(c + 1) * padded_dim];
+                                    for (d, &v) in dst.iter_mut().zip(src.iter()) {
+                                        *d += f64::from(v);
+                                    }
+                                }
+                            }
+                            (acc_s, acc_c)
+                        },
+                    )
+                    .reduce(
+                        || (vec![0.0_f64; k * padded_dim], vec![0_u64; k]),
+                        |(mut sa, mut ca), (sb, cb)| {
+                            for (a, b) in sa.iter_mut().zip(sb.iter()) {
+                                *a += *b;
+                            }
+                            for (a, b) in ca.iter_mut().zip(cb.iter()) {
+                                *a += *b;
+                            }
+                            (sa, ca)
+                        },
+                    );
+                counts = new_counts;
+                for c in 0..k {
+                    if counts[c] == 0 {
+                        continue;
+                    }
+                    let src = &sums[c * padded_dim..(c + 1) * padded_dim];
+                    let norm_sq: f64 = src.iter().map(|&x| x * x).sum();
+                    if norm_sq > 1e-16 {
+                        let inv_norm = 1.0_f64 / norm_sq.sqrt();
+                        let dst = &mut refined_centroids[c * padded_dim..(c + 1) * padded_dim];
+                        for (d, &v) in dst.iter_mut().zip(src.iter()) {
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                *d = (v * inv_norm) as f32;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for &cid in &km.assignments {
+                if let Ok(idx) = usize::try_from(cid) {
+                    if let Some(c) = counts.get_mut(idx) {
+                        *c += 1;
+                    }
                 }
             }
         }
 
+        let refined_f16: Vec<f16> = refined_centroids
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
         let permutation = solve_tsp_locality_largest_first(
-            km.centroids_f16.as_slice(),
+            &refined_f16,
             k,
             padded_dim,
             &counts,
             self.config.tsp_max_2opt_passes,
         )?;
-        let centroids_f16 =
-            permutation.reorder_centroids_f16(km.centroids_f16.as_slice(), padded_dim)?;
+        let centroids_f16 = permutation.reorder_centroids_f16(&refined_f16, padded_dim)?;
         let centroids_f32: Vec<f32> = centroids_f16.iter().map(|v| v.to_f32()).collect();
-        let signs = RademacherSigns::from_seed(padded_dim, self.config.fwht_seed)?;
+        let centroid_half_norm_sq: Vec<f32> = (0..k)
+            .map(|c| {
+                let slice = &centroids_f32[c * padded_dim..(c + 1) * padded_dim];
+                let sq: f32 = slice.iter().map(|&x| x * x).sum();
+                0.5_f32 * sq
+            })
+            .collect();
 
         Ok(TrainedLakeCodebook {
             orig_dim,
@@ -2254,7 +2366,8 @@ impl OutOfCoreIngestPipeline {
             fwht_seed: self.config.fwht_seed,
             centroids_f16,
             centroids_f32,
-            xor_masks: signs.xor_masks().to_vec(),
+            centroid_half_norm_sq,
+            xor_masks,
             permutation,
         })
     }
@@ -2273,27 +2386,89 @@ impl OutOfCoreIngestPipeline {
                 dim: vector_f32.len(),
             });
         }
+        let simd = SimdEngine::new_auto();
         scratch.resize(codebook.padded_dim, 0.0_f32);
         prepare_and_pad_vector(vector_f32, scratch)?;
-        ScalarClusterKernel.fwht_rotate_in_place(scratch, &codebook.xor_masks)?;
+        SimdBackend::fwht_rotate_in_place(&simd, scratch, &codebook.xor_masks)?;
 
-        let mut best_cluster = 0_u32;
-        let mut best_dist_sq = f32::INFINITY;
-        for c in 0..codebook.num_clusters {
-            let start = c * codebook.padded_dim;
-            let centroid = &codebook.centroids_f32[start..start + codebook.padded_dim];
-            let mut dist_sq = 0.0_f32;
-            for (&a, &b) in scratch.iter().zip(centroid.iter()) {
-                let d = a - b;
-                dist_sq += d * d;
-            }
-            if dist_sq < best_dist_sq {
-                best_dist_sq = dist_sq;
-                best_cluster =
-                    u32::try_from(c).map_err(|_| OspreyError::InvalidDimension { dim: c })?;
-            }
+        let mut best = [0_u32; 1];
+        simd.batch_nearest_centroid_l2_f32(
+            scratch,
+            1,
+            &codebook.centroids_f32,
+            &codebook.centroid_half_norm_sq,
+            codebook.padded_dim,
+            codebook.num_clusters,
+            &mut best,
+        );
+        Ok(best[0])
+    }
+
+    /// Parallel SIMD Pass-2 assignment: validates/pads/rotates `num_rows` vectors with FWHT,
+    /// assigns each to its nearest TSP physical centroid using cache-blocked SIMD L2 evaluation,
+    /// and packs the `f16` vectors into `out_f16`.
+    pub fn assign_tsp_clusters_batch(
+        &self,
+        codebook: &TrainedLakeCodebook,
+        vectors_f32: &[f32],
+        num_rows: usize,
+        out_clusters: &mut Vec<u32>,
+        out_f16: &mut Vec<f16>,
+    ) -> OspreyResult<()> {
+        let orig_dim = codebook.orig_dim;
+        let padded_dim = codebook.padded_dim;
+        if orig_dim == 0 || padded_dim == 0 {
+            return Err(OspreyError::InvalidDimension { dim: orig_dim });
         }
-        Ok(best_cluster)
+        let expected = num_rows
+            .checked_mul(orig_dim)
+            .ok_or(OspreyError::InvalidDimension { dim: num_rows })?;
+        if vectors_f32.len() < expected {
+            return Err(OspreyError::BufferTooSmall {
+                needed: expected * std::mem::size_of::<f32>(),
+                actual: std::mem::size_of_val(vectors_f32),
+            });
+        }
+
+        out_clusters.resize(num_rows, 0);
+        out_f16.resize(expected, f16::ZERO);
+        if num_rows == 0 {
+            return Ok(());
+        }
+
+        let simd = SimdEngine::new_auto();
+        const CHUNK_ROWS: usize = 256;
+        let src_chunks = vectors_f32[..expected].par_chunks(CHUNK_ROWS * orig_dim);
+        let dst_cluster_chunks = out_clusters.par_chunks_mut(CHUNK_ROWS);
+        let dst_f16_chunks = out_f16.par_chunks_mut(CHUNK_ROWS * orig_dim);
+
+        src_chunks
+            .zip(dst_cluster_chunks)
+            .zip(dst_f16_chunks)
+            .try_for_each(|((v_chunk, c_chunk), f16_chunk)| -> OspreyResult<()> {
+                let rows = c_chunk.len();
+                let mut rot_buf = vec![0.0_f32; rows * padded_dim];
+                for r in 0..rows {
+                    let src_row = &v_chunk[r * orig_dim..(r + 1) * orig_dim];
+                    let dst_rot = &mut rot_buf[r * padded_dim..(r + 1) * padded_dim];
+                    prepare_and_pad_vector(src_row, dst_rot)?;
+                    SimdBackend::fwht_rotate_in_place(&simd, dst_rot, &codebook.xor_masks)?;
+                    let dst_f16 = &mut f16_chunk[r * orig_dim..(r + 1) * orig_dim];
+                    for (dst, &val) in dst_f16.iter_mut().zip(src_row.iter()) {
+                        *dst = f16::from_f32(val);
+                    }
+                }
+                simd.batch_nearest_centroid_l2_f32(
+                    &rot_buf,
+                    rows,
+                    &codebook.centroids_f32,
+                    &codebook.centroid_half_norm_sq,
+                    padded_dim,
+                    codebook.num_clusters,
+                    c_chunk,
+                );
+                Ok(())
+            })
     }
 
     /// Executes the full two-pass out-of-core pipeline against a Parquet source factory
@@ -2334,7 +2509,6 @@ impl OutOfCoreIngestPipeline {
 
         let mut filter_index = ScalarFilterIndex::new();
         let mut chunk_reports = Vec::new();
-        let mut rot_scratch = vec![0.0_f32; codebook.padded_dim];
         let mut total_vectors_indexed = 0_u64;
         let mut total_batches = 0_usize;
         let mut minipage_offset = 0_u32;
@@ -2357,17 +2531,13 @@ impl OutOfCoreIngestPipeline {
 
             let mut cluster_ids = Vec::with_capacity(n);
             let mut vectors_f16 = Vec::with_capacity(n * dim);
-            for row in 0..n {
-                let vec_slice = &vectors_f32[row * dim..(row + 1) * dim];
-                cluster_ids.push(self.assign_tsp_cluster(
-                    &codebook,
-                    vec_slice,
-                    &mut rot_scratch,
-                )?);
-                for &v in vec_slice {
-                    vectors_f16.push(f16::from_f32(v));
-                }
-            }
+            self.assign_tsp_clusters_batch(
+                &codebook,
+                &vectors_f32,
+                n,
+                &mut cluster_ids,
+                &mut vectors_f16,
+            )?;
             // Release raw f32 batch buffer before compressing and writing slabs.
             drop(vectors_f32);
 
@@ -3008,6 +3178,45 @@ mod tests {
         aligned_slab.as_mut_slice().copy_from_slice(&slab_blobs[0]);
         let slab0 = crate::osv_slab::OsvSlabView::from_bytes(aligned_slab.as_slice())?;
         assert_eq!(slab0.header.total_vectors, chunk_rows as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn assign_tsp_clusters_batch_matches_single_vector_assignment() -> OspreyResult<()> {
+        let dim = 64usize;
+        let n = 137usize;
+        let mut rng = SplitMix64::new(0xA551_6B22);
+        let mut vecs = Vec::with_capacity(n * dim);
+        for _ in 0..(n * dim) {
+            #[allow(clippy::cast_possible_truncation)]
+            vecs.push(
+                (((rng.next_u64() >> 11) as f64) / ((1_u64 << 53) as f64) * 2.0 - 1.0) as f32,
+            );
+        }
+
+        let pipeline = OutOfCoreIngestPipeline::new(OutOfCoreIngestConfig {
+            num_clusters: 16,
+            ..Default::default()
+        });
+        let codebook = pipeline.train_codebook(&vecs, n, dim)?;
+
+        let mut single_ids = Vec::with_capacity(n);
+        let mut single_f16 = Vec::with_capacity(n * dim);
+        let mut scratch = Vec::new();
+        for r in 0..n {
+            let row = &vecs[r * dim..(r + 1) * dim];
+            single_ids.push(pipeline.assign_tsp_cluster(&codebook, row, &mut scratch)?);
+            for &v in row {
+                single_f16.push(f16::from_f32(v));
+            }
+        }
+
+        let mut batch_ids = Vec::new();
+        let mut batch_f16 = Vec::new();
+        pipeline.assign_tsp_clusters_batch(&codebook, &vecs, n, &mut batch_ids, &mut batch_f16)?;
+
+        assert_eq!(batch_ids, single_ids);
+        assert_eq!(batch_f16, single_f16);
         Ok(())
     }
 }

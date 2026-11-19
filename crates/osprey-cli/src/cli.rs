@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use osprey_storage::DEFAULT_MAX_TRAINING_SAMPLE_VECTORS;
 
 /// Root CLI parser for `osprey` engine commands.
 #[derive(Debug, Parser)]
@@ -127,9 +126,13 @@ pub struct ImportArgs {
     #[arg(long, default_value_t = 4096)]
     pub batch_size: usize,
 
-    /// Maximum Pass-1 reservoir sample size for `1-Bit Binary K-Means` training.
-    #[arg(long, default_value_t = DEFAULT_MAX_TRAINING_SAMPLE_VECTORS)]
+    /// Maximum Pass-1 reservoir sample size for Binary K-Means (`0` = auto `max(65536, 256 * K)`).
+    #[arg(long, default_value_t = 0)]
     pub sample_size: usize,
+
+    /// RaBitQ residual quantization bit-width per coordinate (`1` = 1-bit bitplane, `4` = 4-bit FastScan).
+    #[arg(long, default_value_t = 1)]
+    pub bits: u8,
 
     /// Disable Zstd payload dictionary training on `.osv` slabs.
     #[arg(long)]

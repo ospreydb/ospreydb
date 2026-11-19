@@ -31,6 +31,12 @@ pub const LOW_DIM_DEFAULT_CANDIDATES: usize = 2000;
 /// Default Stage-1 candidate pool when the caller requests auto-sizing on high-dimensional data.
 pub const HIGH_DIM_DEFAULT_CANDIDATES: usize = 300;
 
+/// Default Stage-1 candidate pool for 4-bit `RaBitQ` on low-dimensional data (`orig_dim <= 256`).
+pub const FOUR_BIT_LOW_DIM_DEFAULT_CANDIDATES: usize = 100;
+
+/// Default Stage-1 candidate pool for 4-bit `RaBitQ` on high-dimensional data (`orig_dim > 256`).
+pub const FOUR_BIT_HIGH_DIM_DEFAULT_CANDIDATES: usize = 40;
+
 /// User-facing Stage-1 search knobs before adaptive resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
@@ -61,14 +67,24 @@ impl SearchOptions {
         }
     }
 
-    /// Resolves the adaptive oversampling policy for an unpadded `orig_dim`.
+    /// Resolves the adaptive oversampling policy for an unpadded `orig_dim` (1-bit `.osi`).
     ///
     /// `candidates == 0` selects the policy default ([`LOW_DIM_DEFAULT_CANDIDATES`] for
     /// low-dimensional data, [`HIGH_DIM_DEFAULT_CANDIDATES`] otherwise). The candidate-pool
     /// floor ([`LOW_DIM_REFINE_POOL`]) only applies while oversampling is active, so
     /// `refine_multiplier = 1` fully disables the low-dimensional adaptation.
     pub fn resolve(&self, orig_dim: u16) -> ResolvedSearchPlan {
-        let low_dim = orig_dim <= LOW_DIM_OVERSAMPLE_THRESHOLD;
+        self.resolve_for_bits(orig_dim, 1)
+    }
+
+    /// Resolves the Stage-1/Stage-3 sizing policy for an unpadded `orig_dim` and `.osi`
+    /// `RaBitQ` bit-width (`1` or `4`).
+    ///
+    /// When `rabitq_bits >= 4` (4-bit `RaBitQ`), the 1-bit low-dimensional `2x` oversampling,
+    /// `2000`-candidate default, and `128`-candidate `f16` floor are **not** applied.
+    pub fn resolve_for_bits(&self, orig_dim: u16, rabitq_bits: u8) -> ResolvedSearchPlan {
+        let is_4bit = rabitq_bits >= 4;
+        let low_dim = !is_4bit && orig_dim <= LOW_DIM_OVERSAMPLE_THRESHOLD;
         let refine_multiplier = if self.refine_multiplier == 0 {
             if low_dim {
                 DEFAULT_LOW_DIM_OVERSAMPLE_MULTIPLIER
@@ -81,7 +97,13 @@ impl SearchOptions {
 
         let auto_candidates = self.candidates == 0;
         let base_candidates = if auto_candidates {
-            if low_dim {
+            if is_4bit {
+                if orig_dim <= LOW_DIM_OVERSAMPLE_THRESHOLD {
+                    FOUR_BIT_LOW_DIM_DEFAULT_CANDIDATES
+                } else {
+                    FOUR_BIT_HIGH_DIM_DEFAULT_CANDIDATES
+                }
+            } else if low_dim {
                 LOW_DIM_DEFAULT_CANDIDATES
             } else {
                 HIGH_DIM_DEFAULT_CANDIDATES
@@ -264,5 +286,36 @@ mod tests {
         let plan = options.resolve(128);
         assert_eq!(plan.refine_limit, 300);
         assert_eq!(plan.stage1_limit, 300);
+    }
+
+    #[test]
+    fn four_bit_skips_low_dim_oversampling_and_2000_default() {
+        let explicit = SearchOptions::new(16, 40, 10).resolve_for_bits(128, 4);
+        assert_eq!(explicit.refine_multiplier, 1);
+        assert_eq!(explicit.effective_nprobe, 16);
+        assert_eq!(explicit.effective_candidates, 40);
+        assert_eq!(explicit.refine_limit, 10);
+        assert_eq!(explicit.stage1_limit, 40);
+        assert!(!explicit.low_dim_oversample);
+
+        let auto_low = SearchOptions::new(16, 0, 10).resolve_for_bits(128, 4);
+        assert!(auto_low.auto_candidates);
+        assert_eq!(auto_low.refine_multiplier, 1);
+        assert_eq!(auto_low.effective_nprobe, 16);
+        assert_eq!(
+            auto_low.effective_candidates,
+            FOUR_BIT_LOW_DIM_DEFAULT_CANDIDATES
+        );
+        assert_eq!(auto_low.refine_limit, 10);
+        assert!(!auto_low.low_dim_oversample);
+
+        let auto_high = SearchOptions::new(16, 0, 10).resolve_for_bits(768, 4);
+        assert!(auto_high.auto_candidates);
+        assert_eq!(auto_high.refine_multiplier, 1);
+        assert_eq!(
+            auto_high.effective_candidates,
+            FOUR_BIT_HIGH_DIM_DEFAULT_CANDIDATES
+        );
+        assert!(!auto_high.low_dim_oversample);
     }
 }

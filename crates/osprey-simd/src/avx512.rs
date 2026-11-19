@@ -875,3 +875,536 @@ pub unsafe fn dot_f32_f16_avx512(a_f32: &[f32], b_f16: &[half::f16]) -> f32 {
     }
     sum
 }
+
+/// Computes `out_dots.len()` exact `int4 x 1-bit` inner products over contiguous
+/// `words_per_vec`-word vectors, keeping query bit-planes and signs pinned in ZMM registers.
+///
+/// # Safety
+/// Caller must ensure the host CPU supports `avx512f` and `avx512vpopcntdq`.
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+pub unsafe fn rabitq_1bit_batch_dots_u64_avx512(
+    query_planes: &[[u64; 4]],
+    query_signs: &[u64],
+    query_abs_sum: i32,
+    db_words_contiguous: &[u64],
+    words_per_vec: usize,
+    out_dots: &mut [i32],
+) {
+    if words_per_vec == 0 || query_planes.len() < words_per_vec || query_signs.len() < words_per_vec
+    {
+        out_dots.fill(0);
+        return;
+    }
+    let count = out_dots
+        .len()
+        .min(db_words_contiguous.len() / words_per_vec);
+    if count == 0 {
+        return;
+    }
+
+    let qp_ptr = query_planes.as_ptr().cast::<u64>();
+    let sign_ptr = query_signs.as_ptr();
+    let db_ptr = db_words_contiguous.as_ptr();
+
+    let idx_lo = _mm512_set_epi64(13, 9, 12, 8, 5, 1, 4, 0);
+    let idx_hi = _mm512_set_epi64(15, 11, 14, 10, 7, 3, 6, 2);
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn load_transposed_8(
+        qp_ptr: *const u64,
+        sign_ptr: *const u64,
+        w_off: usize,
+        idx_lo: __m512i,
+        idx_hi: __m512i,
+    ) -> (__m512i, __m512i, __m512i, __m512i, __m512i) {
+        unsafe {
+            let v_sign = _mm512_loadu_si512(sign_ptr.add(w_off).cast::<__m512i>());
+            let base = qp_ptr.add(w_off * 4);
+            let r0 = _mm512_loadu_si512(base.cast::<__m512i>());
+            let r1 = _mm512_loadu_si512(base.add(8).cast::<__m512i>());
+            let r2 = _mm512_loadu_si512(base.add(16).cast::<__m512i>());
+            let r3 = _mm512_loadu_si512(base.add(24).cast::<__m512i>());
+
+            let t0 = _mm512_unpacklo_epi64(r0, r1);
+            let t1 = _mm512_unpackhi_epi64(r0, r1);
+            let t2 = _mm512_unpacklo_epi64(r2, r3);
+            let t3 = _mm512_unpackhi_epi64(r2, r3);
+
+            let vp0 = _mm512_permutex2var_epi64(t0, idx_lo, t2);
+            let vp2 = _mm512_permutex2var_epi64(t0, idx_hi, t2);
+            let vp1 = _mm512_permutex2var_epi64(t1, idx_lo, t3);
+            let vp3 = _mm512_permutex2var_epi64(t1, idx_hi, t3);
+            (vp0, vp1, vp2, vp3, v_sign)
+        }
+    }
+
+    if words_per_vec == 16 {
+        let (vp0_a, vp1_a, vp2_a, vp3_a, vs_a) =
+            unsafe { load_transposed_8(qp_ptr, sign_ptr, 0, idx_lo, idx_hi) };
+        let (vp0_b, vp1_b, vp2_b, vp3_b, vs_b) =
+            unsafe { load_transposed_8(qp_ptr, sign_ptr, 8, idx_lo, idx_hi) };
+
+        for (i, dst) in out_dots.iter_mut().enumerate().take(count) {
+            unsafe {
+                let ptr = db_ptr.add(i * 16);
+                if i + 4 < count {
+                    let pf = db_ptr.add((i + 4) * 16);
+                    _mm_prefetch::<_MM_HINT_T0>(pf.cast::<i8>());
+                    _mm_prefetch::<_MM_HINT_T0>(pf.add(8).cast::<i8>());
+                }
+                let db0 = _mm512_loadu_si512(ptr.cast::<__m512i>());
+                let db1 = _mm512_loadu_si512(ptr.add(8).cast::<__m512i>());
+
+                let c0 = _mm512_add_epi64(
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp0_a, vs_a, db0)),
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp0_b, vs_b, db1)),
+                );
+                let c1 = _mm512_add_epi64(
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp1_a, vs_a, db0)),
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp1_b, vs_b, db1)),
+                );
+                let c2 = _mm512_add_epi64(
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp2_a, vs_a, db0)),
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp2_b, vs_b, db1)),
+                );
+                let c3 = _mm512_add_epi64(
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp3_a, vs_a, db0)),
+                    _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp3_b, vs_b, db1)),
+                );
+
+                let w01 = _mm512_add_epi64(c0, _mm512_slli_epi64::<1>(c1));
+                let w23 = _mm512_add_epi64(_mm512_slli_epi64::<2>(c2), _mm512_slli_epi64::<3>(c3));
+                let total_matched = _mm512_reduce_add_epi64(_mm512_add_epi64(w01, w23));
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *dst = (2 * (total_matched as i32)) - query_abs_sum;
+                }
+            }
+        }
+    } else if words_per_vec == 8 {
+        let (vp0, vp1, vp2, vp3, vs) =
+            unsafe { load_transposed_8(qp_ptr, sign_ptr, 0, idx_lo, idx_hi) };
+        for (i, dst) in out_dots.iter_mut().enumerate().take(count) {
+            unsafe {
+                let ptr = db_ptr.add(i * 8);
+                if i + 4 < count {
+                    _mm_prefetch::<_MM_HINT_T0>(db_ptr.add((i + 4) * 8).cast::<i8>());
+                }
+                let db = _mm512_loadu_si512(ptr.cast::<__m512i>());
+                let c0 = _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp0, vs, db));
+                let c1 = _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp1, vs, db));
+                let c2 = _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp2, vs, db));
+                let c3 = _mm512_popcnt_epi64(_mm512_ternarylogic_epi64::<0x90>(vp3, vs, db));
+
+                let w01 = _mm512_add_epi64(c0, _mm512_slli_epi64::<1>(c1));
+                let w23 = _mm512_add_epi64(_mm512_slli_epi64::<2>(c2), _mm512_slli_epi64::<3>(c3));
+                let total_matched = _mm512_reduce_add_epi64(_mm512_add_epi64(w01, w23));
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *dst = (2 * (total_matched as i32)) - query_abs_sum;
+                }
+            }
+        }
+    } else {
+        for (i, dst) in out_dots.iter_mut().enumerate().take(count) {
+            let start = i * words_per_vec;
+            *dst = unsafe {
+                rabitq_4bit_dot_u64_avx512(
+                    query_planes,
+                    query_signs,
+                    query_abs_sum,
+                    &db_words_contiguous[start..start + words_per_vec],
+                )
+            };
+        }
+    }
+}
+
+/// Evaluates one transposed 32-vector 4-bit `RaBitQ` FastScan block using AVX-512F + AVX-512BW
+/// (`_mm512_shuffle_epi8`), processing 2 dimension-pairs (4 dimensions, 64 bytes) per step.
+///
+/// # Safety
+/// Caller must ensure the host CPU supports `avx512f` and `avx512bw`.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub unsafe fn rabitq_4bit_fastscan_block_avx512(
+    q_lut_u8: &[u8],
+    padded_dim: usize,
+    block_bytes: &[u8],
+    out_sums: &mut [u32; 32],
+) {
+    let needed = padded_dim.saturating_mul(16);
+    if padded_dim == 0
+        || !padded_dim.is_multiple_of(2)
+        || q_lut_u8.len() < needed
+        || block_bytes.len() < needed
+    {
+        out_sums.fill(0);
+        return;
+    }
+
+    let num_pairs = padded_dim / 2;
+    let lut_ptr = q_lut_u8.as_ptr();
+    let blk_ptr = block_bytes.as_ptr();
+
+    let mask_0f = _mm512_set1_epi8(0x0F);
+    let zero = _mm512_setzero_si512();
+
+    let mut total_a = _mm512_setzero_si512();
+    let mut total_b = _mm512_setzero_si512();
+    let mut total_c = _mm512_setzero_si512();
+    let mut total_d = _mm512_setzero_si512();
+
+    // Each iteration accumulates `u8 -> u16` for up to 32 steps (64 pairs = 128 dims),
+    // keeping each `u16` lane bounded by `32 * 2 * 255 = 16320 < 65535`.
+    let mut m = 0usize;
+    while m + 1 < num_pairs {
+        let mut acc_lo = _mm512_setzero_si512();
+        let mut acc_hi = _mm512_setzero_si512();
+        let chunk_end = (m + 64).min(num_pairs & !1);
+
+        while m + 1 < chunk_end {
+            // SAFETY: `m + 1 < num_pairs`, so `(m + 2) * 32 <= needed` and `(2 * m + 4) * 16 <= needed`.
+            unsafe {
+                let packed = _mm512_loadu_si512(blk_ptr.add(m * 32).cast::<__m512i>());
+                let lo_idx = _mm512_and_si512(packed, mask_0f);
+                let hi_idx = _mm512_and_si512(_mm512_srli_epi16::<4>(packed), mask_0f);
+
+                let luts = _mm512_loadu_si512(lut_ptr.add((2 * m) * 16).cast::<__m512i>());
+                let lut_even = _mm512_shuffle_i32x4::<0xA0>(luts, luts);
+                let lut_odd = _mm512_shuffle_i32x4::<0xF5>(luts, luts);
+
+                let ve = _mm512_shuffle_epi8(lut_even, lo_idx);
+                let vo = _mm512_shuffle_epi8(lut_odd, hi_idx);
+
+                let sum_lo16 = _mm512_add_epi16(
+                    _mm512_unpacklo_epi8(ve, zero),
+                    _mm512_unpacklo_epi8(vo, zero),
+                );
+                let sum_hi16 = _mm512_add_epi16(
+                    _mm512_unpackhi_epi8(ve, zero),
+                    _mm512_unpackhi_epi8(vo, zero),
+                );
+                acc_lo = _mm512_add_epi16(acc_lo, sum_lo16);
+                acc_hi = _mm512_add_epi16(acc_hi, sum_hi16);
+            }
+            m += 2;
+        }
+
+        total_a = _mm512_add_epi32(total_a, _mm512_unpacklo_epi16(acc_lo, zero));
+        total_b = _mm512_add_epi32(total_b, _mm512_unpackhi_epi16(acc_lo, zero));
+        total_c = _mm512_add_epi32(total_c, _mm512_unpacklo_epi16(acc_hi, zero));
+        total_d = _mm512_add_epi32(total_d, _mm512_unpackhi_epi16(acc_hi, zero));
+    }
+
+    // Fold the high 256-bit pair sums (`pair_{m+1}`) into the low 256-bit pair sums (`pair_m`).
+    let a256 = _mm256_add_epi32(
+        _mm512_castsi512_si256(total_a),
+        _mm512_extracti64x4_epi64::<1>(total_a),
+    );
+    let b256 = _mm256_add_epi32(
+        _mm512_castsi512_si256(total_b),
+        _mm512_extracti64x4_epi64::<1>(total_b),
+    );
+    let c256 = _mm256_add_epi32(
+        _mm512_castsi512_si256(total_c),
+        _mm512_extracti64x4_epi64::<1>(total_c),
+    );
+    let d256 = _mm256_add_epi32(
+        _mm512_castsi512_si256(total_d),
+        _mm512_extracti64x4_epi64::<1>(total_d),
+    );
+
+    // SAFETY: `out_sums` has 32 elements: lanes [0..4, 16..20], [4..8, 20..24], [8..12, 24..28], [12..16, 28..32].
+    unsafe {
+        let out_ptr = out_sums.as_mut_ptr().cast::<__m128i>();
+        _mm_storeu_si128(out_ptr, _mm256_castsi256_si128(a256));
+        _mm_storeu_si128(out_ptr.add(4), _mm256_extracti128_si256::<1>(a256));
+        _mm_storeu_si128(out_ptr.add(1), _mm256_castsi256_si128(b256));
+        _mm_storeu_si128(out_ptr.add(5), _mm256_extracti128_si256::<1>(b256));
+        _mm_storeu_si128(out_ptr.add(2), _mm256_castsi256_si128(c256));
+        _mm_storeu_si128(out_ptr.add(6), _mm256_extracti128_si256::<1>(c256));
+        _mm_storeu_si128(out_ptr.add(3), _mm256_castsi256_si128(d256));
+        _mm_storeu_si128(out_ptr.add(7), _mm256_extracti128_si256::<1>(d256));
+    }
+
+    if m < num_pairs {
+        let lut_even = &q_lut_u8[(2 * m) * 16..(2 * m) * 16 + 16];
+        let lut_odd = &q_lut_u8[(2 * m + 1) * 16..(2 * m + 1) * 16 + 16];
+        let pair_bytes = &block_bytes[m * 32..(m + 1) * 32];
+        for (j, &b) in pair_bytes.iter().enumerate() {
+            out_sums[j] += u32::from(lut_even[usize::from(b & 0x0F)])
+                + u32::from(lut_odd[usize::from(b >> 4)]);
+        }
+    }
+}
+
+/// Computes `argmin_c (0.5 * ||c||^2 - <q, c>)` across a batch of queries using
+/// cache-tiled 4x4 AVX-512F + FMA inner loops.
+///
+/// # Safety
+/// Caller must ensure the host CPU supports `avx512f` and `fma`.
+#[target_feature(enable = "avx512f,fma")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn batch_nearest_centroid_l2_f32_avx512(
+    queries: &[f32],
+    num_queries: usize,
+    centroids: &[f32],
+    centroid_half_norm_sq: &[f32],
+    dim: usize,
+    num_centroids: usize,
+    out_clusters: &mut [u32],
+) {
+    if num_queries == 0 || dim == 0 || num_centroids == 0 {
+        return;
+    }
+
+    const Q_BLK: usize = 32;
+    const C_BLK: usize = 64;
+
+    let mut q_base = 0usize;
+    while q_base < num_queries {
+        let q_count = (num_queries - q_base).min(Q_BLK);
+        let mut best_scores = [f32::INFINITY; Q_BLK];
+        let mut best_ids = [0_u32; Q_BLK];
+
+        let mut c_blk = 0usize;
+        while c_blk < num_centroids {
+            let c_blk_end = (c_blk + C_BLK).min(num_centroids);
+
+            let mut ql = 0usize;
+            while ql + 4 <= q_count {
+                let q0_ptr = unsafe { queries.as_ptr().add((q_base + ql) * dim) };
+                let q1_ptr = unsafe { queries.as_ptr().add((q_base + ql + 1) * dim) };
+                let q2_ptr = unsafe { queries.as_ptr().add((q_base + ql + 2) * dim) };
+                let q3_ptr = unsafe { queries.as_ptr().add((q_base + ql + 3) * dim) };
+
+                let mut c = c_blk;
+                while c + 4 <= c_blk_end {
+                    let c0_ptr = unsafe { centroids.as_ptr().add(c * dim) };
+                    let c1_ptr = unsafe { centroids.as_ptr().add((c + 1) * dim) };
+                    let c2_ptr = unsafe { centroids.as_ptr().add((c + 2) * dim) };
+                    let c3_ptr = unsafe { centroids.as_ptr().add((c + 3) * dim) };
+
+                    let mut acc00 = _mm512_setzero_ps();
+                    let mut acc01 = _mm512_setzero_ps();
+                    let mut acc02 = _mm512_setzero_ps();
+                    let mut acc03 = _mm512_setzero_ps();
+                    let mut acc10 = _mm512_setzero_ps();
+                    let mut acc11 = _mm512_setzero_ps();
+                    let mut acc12 = _mm512_setzero_ps();
+                    let mut acc13 = _mm512_setzero_ps();
+                    let mut acc20 = _mm512_setzero_ps();
+                    let mut acc21 = _mm512_setzero_ps();
+                    let mut acc22 = _mm512_setzero_ps();
+                    let mut acc23 = _mm512_setzero_ps();
+                    let mut acc30 = _mm512_setzero_ps();
+                    let mut acc31 = _mm512_setzero_ps();
+                    let mut acc32 = _mm512_setzero_ps();
+                    let mut acc33 = _mm512_setzero_ps();
+
+                    let mut d = 0usize;
+                    while d + 16 <= dim {
+                        unsafe {
+                            let vq0 = _mm512_loadu_ps(q0_ptr.add(d));
+                            let vq1 = _mm512_loadu_ps(q1_ptr.add(d));
+                            let vq2 = _mm512_loadu_ps(q2_ptr.add(d));
+                            let vq3 = _mm512_loadu_ps(q3_ptr.add(d));
+
+                            let vc0 = _mm512_loadu_ps(c0_ptr.add(d));
+                            let vc1 = _mm512_loadu_ps(c1_ptr.add(d));
+                            let vc2 = _mm512_loadu_ps(c2_ptr.add(d));
+                            let vc3 = _mm512_loadu_ps(c3_ptr.add(d));
+
+                            acc00 = _mm512_fmadd_ps(vq0, vc0, acc00);
+                            acc01 = _mm512_fmadd_ps(vq0, vc1, acc01);
+                            acc02 = _mm512_fmadd_ps(vq0, vc2, acc02);
+                            acc03 = _mm512_fmadd_ps(vq0, vc3, acc03);
+
+                            acc10 = _mm512_fmadd_ps(vq1, vc0, acc10);
+                            acc11 = _mm512_fmadd_ps(vq1, vc1, acc11);
+                            acc12 = _mm512_fmadd_ps(vq1, vc2, acc12);
+                            acc13 = _mm512_fmadd_ps(vq1, vc3, acc13);
+
+                            acc20 = _mm512_fmadd_ps(vq2, vc0, acc20);
+                            acc21 = _mm512_fmadd_ps(vq2, vc1, acc21);
+                            acc22 = _mm512_fmadd_ps(vq2, vc2, acc22);
+                            acc23 = _mm512_fmadd_ps(vq2, vc3, acc23);
+
+                            acc30 = _mm512_fmadd_ps(vq3, vc0, acc30);
+                            acc31 = _mm512_fmadd_ps(vq3, vc1, acc31);
+                            acc32 = _mm512_fmadd_ps(vq3, vc2, acc32);
+                            acc33 = _mm512_fmadd_ps(vq3, vc3, acc33);
+                        }
+                        d += 16;
+                    }
+
+                    let mut dots = [
+                        [
+                            _mm512_reduce_add_ps(acc00),
+                            _mm512_reduce_add_ps(acc01),
+                            _mm512_reduce_add_ps(acc02),
+                            _mm512_reduce_add_ps(acc03),
+                        ],
+                        [
+                            _mm512_reduce_add_ps(acc10),
+                            _mm512_reduce_add_ps(acc11),
+                            _mm512_reduce_add_ps(acc12),
+                            _mm512_reduce_add_ps(acc13),
+                        ],
+                        [
+                            _mm512_reduce_add_ps(acc20),
+                            _mm512_reduce_add_ps(acc21),
+                            _mm512_reduce_add_ps(acc22),
+                            _mm512_reduce_add_ps(acc23),
+                        ],
+                        [
+                            _mm512_reduce_add_ps(acc30),
+                            _mm512_reduce_add_ps(acc31),
+                            _mm512_reduce_add_ps(acc32),
+                            _mm512_reduce_add_ps(acc33),
+                        ],
+                    ];
+
+                    while d < dim {
+                        let qv = unsafe {
+                            [
+                                *q0_ptr.add(d),
+                                *q1_ptr.add(d),
+                                *q2_ptr.add(d),
+                                *q3_ptr.add(d),
+                            ]
+                        };
+                        let cv = unsafe {
+                            [
+                                *c0_ptr.add(d),
+                                *c1_ptr.add(d),
+                                *c2_ptr.add(d),
+                                *c3_ptr.add(d),
+                            ]
+                        };
+                        for qi in 0..4 {
+                            for cj in 0..4 {
+                                dots[qi][cj] += qv[qi] * cv[cj];
+                            }
+                        }
+                        d += 1;
+                    }
+
+                    let hn = [
+                        centroid_half_norm_sq[c],
+                        centroid_half_norm_sq[c + 1],
+                        centroid_half_norm_sq[c + 2],
+                        centroid_half_norm_sq[c + 3],
+                    ];
+                    for (qi, dot_row) in dots.iter().enumerate() {
+                        let slot = ql + qi;
+                        for (cj, &dot) in dot_row.iter().enumerate() {
+                            let score = hn[cj] - dot;
+                            if score < best_scores[slot] {
+                                best_scores[slot] = score;
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    best_ids[slot] = (c + cj) as u32;
+                                }
+                            }
+                        }
+                    }
+
+                    c += 4;
+                }
+
+                while c < c_blk_end {
+                    let c_ptr = unsafe { centroids.as_ptr().add(c * dim) };
+                    let mut acc0 = _mm512_setzero_ps();
+                    let mut acc1 = _mm512_setzero_ps();
+                    let mut acc2 = _mm512_setzero_ps();
+                    let mut acc3 = _mm512_setzero_ps();
+                    let mut d = 0usize;
+                    while d + 16 <= dim {
+                        unsafe {
+                            let vc = _mm512_loadu_ps(c_ptr.add(d));
+                            acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(q0_ptr.add(d)), vc, acc0);
+                            acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(q1_ptr.add(d)), vc, acc1);
+                            acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(q2_ptr.add(d)), vc, acc2);
+                            acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(q3_ptr.add(d)), vc, acc3);
+                        }
+                        d += 16;
+                    }
+                    let mut s = [
+                        _mm512_reduce_add_ps(acc0),
+                        _mm512_reduce_add_ps(acc1),
+                        _mm512_reduce_add_ps(acc2),
+                        _mm512_reduce_add_ps(acc3),
+                    ];
+                    while d < dim {
+                        let cv = unsafe { *c_ptr.add(d) };
+                        s[0] += unsafe { *q0_ptr.add(d) } * cv;
+                        s[1] += unsafe { *q1_ptr.add(d) } * cv;
+                        s[2] += unsafe { *q2_ptr.add(d) } * cv;
+                        s[3] += unsafe { *q3_ptr.add(d) } * cv;
+                        d += 1;
+                    }
+                    let hn = centroid_half_norm_sq[c];
+                    for (qi, &dot) in s.iter().enumerate() {
+                        let slot = ql + qi;
+                        let score = hn - dot;
+                        if score < best_scores[slot] {
+                            best_scores[slot] = score;
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                best_ids[slot] = c as u32;
+                            }
+                        }
+                    }
+                    c += 1;
+                }
+
+                ql += 4;
+            }
+
+            while ql < q_count {
+                let q_ptr = unsafe { queries.as_ptr().add((q_base + ql) * dim) };
+                for (c, &hn) in centroid_half_norm_sq
+                    .iter()
+                    .enumerate()
+                    .take(c_blk_end)
+                    .skip(c_blk)
+                {
+                    let c_ptr = unsafe { centroids.as_ptr().add(c * dim) };
+                    let mut acc = _mm512_setzero_ps();
+                    let mut d = 0usize;
+                    while d + 16 <= dim {
+                        unsafe {
+                            acc = _mm512_fmadd_ps(
+                                _mm512_loadu_ps(q_ptr.add(d)),
+                                _mm512_loadu_ps(c_ptr.add(d)),
+                                acc,
+                            );
+                        }
+                        d += 16;
+                    }
+                    let mut dot = _mm512_reduce_add_ps(acc);
+                    while d < dim {
+                        dot += unsafe { *q_ptr.add(d) * *c_ptr.add(d) };
+                        d += 1;
+                    }
+                    let score = hn - dot;
+                    if score < best_scores[ql] {
+                        best_scores[ql] = score;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            best_ids[ql] = c as u32;
+                        }
+                    }
+                }
+                ql += 1;
+            }
+
+            c_blk = c_blk_end;
+        }
+
+        out_clusters[q_base..q_base + q_count].copy_from_slice(&best_ids[..q_count]);
+        q_base += q_count;
+    }
+}

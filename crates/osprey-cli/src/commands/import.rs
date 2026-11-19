@@ -105,6 +105,9 @@ pub fn run(args: &ImportArgs, ctx: &CliContext) -> CliResult<()> {
             "--batch-size must be greater than 0".to_string(),
         ));
     }
+    if args.bits != 1 && args.bits != 4 {
+        return Err(CliError::InvalidArgs("--bits must be 1 or 4".to_string()));
+    }
 
     let input_target = LocationTarget::parse(&args.input)?;
     let output_target = LocationTarget::parse(&args.output)?;
@@ -149,10 +152,16 @@ pub fn run(args: &ImportArgs, ctx: &CliContext) -> CliResult<()> {
         }
     };
 
+    let k_clusters = usize::try_from(args.clusters).unwrap_or(256);
+    let effective_sample_size = if args.sample_size == 0 {
+        osprey_core::kmeans_subsample_target(usize::MAX, k_clusters)
+    } else {
+        args.sample_size.max(1)
+    };
     let pipeline = OutOfCoreIngestPipeline::new(OutOfCoreIngestConfig {
-        max_training_sample_vectors: args.sample_size.max(1),
+        max_training_sample_vectors: effective_sample_size,
         batch_size_rows: args.batch_size,
-        num_clusters: usize::try_from(args.clusters).unwrap_or(256),
+        num_clusters: k_clusters,
         fwht_seed: args.seed,
         reservoir_seed: args.seed ^ 0x9E37_79B9_7F4A_7C15,
         hints: hints.clone(),
@@ -284,7 +293,7 @@ pub fn run(args: &ImportArgs, ctx: &CliContext) -> CliResult<()> {
         iterations_run: 1,
     };
 
-    let osi_index = OsiIndex::build_from_f16(
+    let osi_index = OsiIndex::build_from_f16_with_bits(
         &corpus.vectors_f16,
         &corpus.doc_ids,
         &corpus.locations,
@@ -292,6 +301,7 @@ pub fn run(args: &ImportArgs, ctx: &CliContext) -> CliResult<()> {
         corpus.orig_dim,
         args.seed,
         RoaringBitmap::new(),
+        args.bits,
         &simd,
     )?;
     let osi_aligned = osi_index.to_aligned_bytes()?;
@@ -754,6 +764,7 @@ fn consume_jsonl_pass2<R: std::io::BufRead>(
 
     let chunk_size = pipeline.config.batch_size_rows.max(1);
     let mut chunk_doc_ids = Vec::with_capacity(chunk_size);
+    let mut chunk_vecs_f32 = Vec::with_capacity(chunk_size.saturating_mul(codebook.orig_dim));
     let mut chunk_cluster_ids = Vec::with_capacity(chunk_size);
     let mut chunk_f16 = Vec::with_capacity(chunk_size.saturating_mul(codebook.orig_dim));
     let mut chunk_payloads: Vec<Vec<u8>> = Vec::with_capacity(chunk_size);
@@ -764,12 +775,8 @@ fn consume_jsonl_pass2<R: std::io::BufRead>(
                 dim: rec.vector.len(),
             }));
         }
-        let cid = pipeline.assign_tsp_cluster(codebook, &rec.vector, &mut acc.rot_scratch)?;
         chunk_doc_ids.push(rec.doc_id);
-        chunk_cluster_ids.push(cid);
-        for &v in &rec.vector {
-            chunk_f16.push(f16::from_f32(v));
-        }
+        chunk_vecs_f32.extend_from_slice(&rec.vector);
         chunk_payloads.push(if rec.metadata_payload.is_empty() {
             b"{}".to_vec()
         } else {
@@ -799,6 +806,13 @@ fn consume_jsonl_pass2<R: std::io::BufRead>(
         }
 
         if chunk_doc_ids.len() >= chunk_size {
+            pipeline.assign_tsp_clusters_batch(
+                codebook,
+                &chunk_vecs_f32,
+                chunk_doc_ids.len(),
+                &mut chunk_cluster_ids,
+                &mut chunk_f16,
+            )?;
             acc.write_chunk(
                 &mut writer,
                 &chunk_doc_ids,
@@ -807,6 +821,7 @@ fn consume_jsonl_pass2<R: std::io::BufRead>(
                 &chunk_payloads,
             )?;
             chunk_doc_ids.clear();
+            chunk_vecs_f32.clear();
             chunk_cluster_ids.clear();
             chunk_f16.clear();
             chunk_payloads.clear();
@@ -814,6 +829,13 @@ fn consume_jsonl_pass2<R: std::io::BufRead>(
         }
     }
     if !chunk_doc_ids.is_empty() {
+        pipeline.assign_tsp_clusters_batch(
+            codebook,
+            &chunk_vecs_f32,
+            chunk_doc_ids.len(),
+            &mut chunk_cluster_ids,
+            &mut chunk_f16,
+        )?;
         acc.write_chunk(
             &mut writer,
             &chunk_doc_ids,
@@ -949,14 +971,13 @@ fn consume_npy_pass2<R: std::io::Read>(
         let n = batch.doc_ids.len();
         let mut cluster_ids = Vec::with_capacity(n);
         let mut vectors_f16 = Vec::with_capacity(n.saturating_mul(codebook.orig_dim));
-        for r in 0..n {
-            let slice = &batch.vectors_f32[r * codebook.orig_dim..(r + 1) * codebook.orig_dim];
-            let cid = pipeline.assign_tsp_cluster(codebook, slice, &mut acc.rot_scratch)?;
-            cluster_ids.push(cid);
-            for &v in slice {
-                vectors_f16.push(f16::from_f32(v));
-            }
-        }
+        pipeline.assign_tsp_clusters_batch(
+            codebook,
+            &batch.vectors_f32,
+            n,
+            &mut cluster_ids,
+            &mut vectors_f16,
+        )?;
         let payloads = vec![b"{}".to_vec(); n];
         acc.write_chunk(
             &mut writer,
@@ -994,11 +1015,10 @@ struct StreamingAccumulator {
     colbert_tokens: Vec<Vec<f32>>,
     colbert_token_counts: Vec<usize>,
     has_colbert: bool,
-    rot_scratch: Vec<f32>,
 }
 
 impl StreamingAccumulator {
-    fn new(cap: usize, orig_dim: usize, padded_dim: usize) -> Self {
+    fn new(cap: usize, orig_dim: usize, _padded_dim: usize) -> Self {
         Self {
             orig_dim,
             doc_ids: Vec::with_capacity(cap),
@@ -1008,7 +1028,6 @@ impl StreamingAccumulator {
             colbert_tokens: Vec::with_capacity(cap),
             colbert_token_counts: Vec::with_capacity(cap),
             has_colbert: false,
-            rot_scratch: vec![0.0_f32; padded_dim],
         }
     }
 
@@ -1065,14 +1084,13 @@ impl StreamingAccumulator {
 
         let mut cluster_ids = Vec::with_capacity(n);
         let mut vectors_f16 = Vec::with_capacity(n.saturating_mul(dim));
-        for r in 0..n {
-            let v_slice = &vecs_f32[r * dim..(r + 1) * dim];
-            let cid = pipeline.assign_tsp_cluster(codebook, v_slice, &mut self.rot_scratch)?;
-            cluster_ids.push(cid);
-            for &v in v_slice {
-                vectors_f16.push(f16::from_f32(v));
-            }
-        }
+        pipeline.assign_tsp_clusters_batch(
+            codebook,
+            &vecs_f32,
+            n,
+            &mut cluster_ids,
+            &mut vectors_f16,
+        )?;
         // Release the raw `f32` batch before compressing + writing the `.osv` blocks.
         drop(vecs_f32);
 
@@ -1434,6 +1452,7 @@ mod tests {
             with_lutrank: true,
             batch_size: 16,
             sample_size: 32,
+            bits: 1,
             no_zstd_dict: false,
             osv_compression: crate::cli::OsvCompressionMode::Auto,
             seed: 0x1234,
@@ -1484,6 +1503,7 @@ mod tests {
             with_lutrank: false,
             batch_size: 8,
             sample_size: 16,
+            bits: 4,
             no_zstd_dict: true,
             osv_compression: crate::cli::OsvCompressionMode::Auto,
             seed: 99,

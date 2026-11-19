@@ -144,7 +144,7 @@ pub fn execute_search(args: &SearchArgs, ctx: &CliContext) -> CliResult<SearchRe
         rerank_top_m: if do_rerank { args.rerank_top_m } else { 0 },
         refine_multiplier: args.refine_multiplier,
     };
-    let plan = options.resolve(orig_dim);
+    let plan = options.resolve_for_bits(orig_dim, osi.header().rabitq_bits());
     let stage1_limit = plan.stage1_limit;
     let refine_limit = plan.refine_limit;
 
@@ -659,6 +659,7 @@ mod tests {
                 with_lutrank: true,
                 batch_size: 16,
                 sample_size: 30,
+                bits: 1,
                 no_zstd_dict: false,
                 osv_compression: crate::cli::OsvCompressionMode::Auto,
                 seed: 77,

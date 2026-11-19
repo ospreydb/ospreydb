@@ -1107,3 +1107,326 @@ pub unsafe fn dot_f32_f16_avx2(a_f32: &[f32], b_f16: &[half::f16]) -> f32 {
     }
     sum
 }
+
+/// Evaluates one transposed 32-vector 4-bit `RaBitQ` FastScan block using AVX2
+/// (`_mm256_shuffle_epi8`), processing one dimension-pair (2 dimensions, 32 bytes) per step.
+///
+/// # Safety
+/// Caller must ensure the host CPU supports `avx2`.
+#[target_feature(enable = "avx2")]
+pub unsafe fn rabitq_4bit_fastscan_block_avx2(
+    q_lut_u8: &[u8],
+    padded_dim: usize,
+    block_bytes: &[u8],
+    out_sums: &mut [u32; 32],
+) {
+    let needed = padded_dim.saturating_mul(16);
+    if padded_dim == 0
+        || !padded_dim.is_multiple_of(2)
+        || q_lut_u8.len() < needed
+        || block_bytes.len() < needed
+    {
+        out_sums.fill(0);
+        return;
+    }
+
+    let num_pairs = padded_dim / 2;
+    let lut_ptr = q_lut_u8.as_ptr();
+    let blk_ptr = block_bytes.as_ptr();
+
+    let mask_0f = _mm256_set1_epi8(0x0F);
+    let zero = _mm256_setzero_si256();
+
+    let mut total_a = _mm256_setzero_si256();
+    let mut total_b = _mm256_setzero_si256();
+    let mut total_c = _mm256_setzero_si256();
+    let mut total_d = _mm256_setzero_si256();
+
+    // Flush u16 accumulators every 64 pairs (`max = 64 * 2 * 255 = 32640 < 65535`).
+    let mut m = 0usize;
+    while m < num_pairs {
+        let mut acc_lo = _mm256_setzero_si256();
+        let mut acc_hi = _mm256_setzero_si256();
+        let chunk_end = (m + 64).min(num_pairs);
+
+        while m < chunk_end {
+            // SAFETY: `m < num_pairs`, so `(m + 1) * 32 <= needed` and `(2 * m + 2) * 16 <= needed`.
+            unsafe {
+                let packed = _mm256_loadu_si256(blk_ptr.add(m * 32).cast::<__m256i>());
+                let lo_idx = _mm256_and_si256(packed, mask_0f);
+                let hi_idx = _mm256_and_si256(_mm256_srli_epi16::<4>(packed), mask_0f);
+
+                let lut_even = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lut_ptr.add((2 * m) * 16).cast::<__m128i>(),
+                ));
+                let lut_odd = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lut_ptr.add((2 * m + 1) * 16).cast::<__m128i>(),
+                ));
+
+                let ve = _mm256_shuffle_epi8(lut_even, lo_idx);
+                let vo = _mm256_shuffle_epi8(lut_odd, hi_idx);
+
+                let sum_lo16 = _mm256_add_epi16(
+                    _mm256_unpacklo_epi8(ve, zero),
+                    _mm256_unpacklo_epi8(vo, zero),
+                );
+                let sum_hi16 = _mm256_add_epi16(
+                    _mm256_unpackhi_epi8(ve, zero),
+                    _mm256_unpackhi_epi8(vo, zero),
+                );
+                acc_lo = _mm256_add_epi16(acc_lo, sum_lo16);
+                acc_hi = _mm256_add_epi16(acc_hi, sum_hi16);
+            }
+            m += 1;
+        }
+
+        total_a = _mm256_add_epi32(total_a, _mm256_unpacklo_epi16(acc_lo, zero));
+        total_b = _mm256_add_epi32(total_b, _mm256_unpackhi_epi16(acc_lo, zero));
+        total_c = _mm256_add_epi32(total_c, _mm256_unpacklo_epi16(acc_hi, zero));
+        total_d = _mm256_add_epi32(total_d, _mm256_unpackhi_epi16(acc_hi, zero));
+    }
+
+    // SAFETY: `out_sums` has 32 elements: lanes [0..4, 16..20], [4..8, 20..24], [8..12, 24..28], [12..16, 28..32].
+    unsafe {
+        let out_ptr = out_sums.as_mut_ptr().cast::<__m128i>();
+        _mm_storeu_si128(out_ptr, _mm256_castsi256_si128(total_a));
+        _mm_storeu_si128(out_ptr.add(4), _mm256_extracti128_si256::<1>(total_a));
+        _mm_storeu_si128(out_ptr.add(1), _mm256_castsi256_si128(total_b));
+        _mm_storeu_si128(out_ptr.add(5), _mm256_extracti128_si256::<1>(total_b));
+        _mm_storeu_si128(out_ptr.add(2), _mm256_castsi256_si128(total_c));
+        _mm_storeu_si128(out_ptr.add(6), _mm256_extracti128_si256::<1>(total_c));
+        _mm_storeu_si128(out_ptr.add(3), _mm256_castsi256_si128(total_d));
+        _mm_storeu_si128(out_ptr.add(7), _mm256_extracti128_si256::<1>(total_d));
+    }
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_ps_avx2(v: __m256) -> f32 {
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps::<1>(v);
+    let sum_128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum_128);
+    let sums = _mm_add_ps(sum_128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
+/// Computes `argmin_c (0.5 * ||c||^2 - <q, c>)` across a batch of queries using
+/// cache-tiled 2x4 AVX2 + FMA inner loops.
+///
+/// # Safety
+/// Caller must ensure the host CPU supports `avx2` and `fma`.
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn batch_nearest_centroid_l2_f32_avx2(
+    queries: &[f32],
+    num_queries: usize,
+    centroids: &[f32],
+    centroid_half_norm_sq: &[f32],
+    dim: usize,
+    num_centroids: usize,
+    out_clusters: &mut [u32],
+) {
+    if num_queries == 0 || dim == 0 || num_centroids == 0 {
+        return;
+    }
+
+    const Q_BLK: usize = 32;
+    const C_BLK: usize = 64;
+
+    let mut q_base = 0usize;
+    while q_base < num_queries {
+        let q_count = (num_queries - q_base).min(Q_BLK);
+        let mut best_scores = [f32::INFINITY; Q_BLK];
+        let mut best_ids = [0_u32; Q_BLK];
+
+        let mut c_blk = 0usize;
+        while c_blk < num_centroids {
+            let c_blk_end = (c_blk + C_BLK).min(num_centroids);
+
+            let mut ql = 0usize;
+            while ql + 2 <= q_count {
+                let q0_ptr = unsafe { queries.as_ptr().add((q_base + ql) * dim) };
+                let q1_ptr = unsafe { queries.as_ptr().add((q_base + ql + 1) * dim) };
+
+                let mut c = c_blk;
+                while c + 4 <= c_blk_end {
+                    let c0_ptr = unsafe { centroids.as_ptr().add(c * dim) };
+                    let c1_ptr = unsafe { centroids.as_ptr().add((c + 1) * dim) };
+                    let c2_ptr = unsafe { centroids.as_ptr().add((c + 2) * dim) };
+                    let c3_ptr = unsafe { centroids.as_ptr().add((c + 3) * dim) };
+
+                    let mut acc00 = _mm256_setzero_ps();
+                    let mut acc01 = _mm256_setzero_ps();
+                    let mut acc02 = _mm256_setzero_ps();
+                    let mut acc03 = _mm256_setzero_ps();
+                    let mut acc10 = _mm256_setzero_ps();
+                    let mut acc11 = _mm256_setzero_ps();
+                    let mut acc12 = _mm256_setzero_ps();
+                    let mut acc13 = _mm256_setzero_ps();
+
+                    let mut d = 0usize;
+                    while d + 8 <= dim {
+                        unsafe {
+                            let vq0 = _mm256_loadu_ps(q0_ptr.add(d));
+                            let vq1 = _mm256_loadu_ps(q1_ptr.add(d));
+                            let vc0 = _mm256_loadu_ps(c0_ptr.add(d));
+                            let vc1 = _mm256_loadu_ps(c1_ptr.add(d));
+                            let vc2 = _mm256_loadu_ps(c2_ptr.add(d));
+                            let vc3 = _mm256_loadu_ps(c3_ptr.add(d));
+
+                            acc00 = _mm256_fmadd_ps(vq0, vc0, acc00);
+                            acc01 = _mm256_fmadd_ps(vq0, vc1, acc01);
+                            acc02 = _mm256_fmadd_ps(vq0, vc2, acc02);
+                            acc03 = _mm256_fmadd_ps(vq0, vc3, acc03);
+
+                            acc10 = _mm256_fmadd_ps(vq1, vc0, acc10);
+                            acc11 = _mm256_fmadd_ps(vq1, vc1, acc11);
+                            acc12 = _mm256_fmadd_ps(vq1, vc2, acc12);
+                            acc13 = _mm256_fmadd_ps(vq1, vc3, acc13);
+                        }
+                        d += 8;
+                    }
+
+                    let mut dots = unsafe {
+                        [
+                            [
+                                hsum_ps_avx2(acc00),
+                                hsum_ps_avx2(acc01),
+                                hsum_ps_avx2(acc02),
+                                hsum_ps_avx2(acc03),
+                            ],
+                            [
+                                hsum_ps_avx2(acc10),
+                                hsum_ps_avx2(acc11),
+                                hsum_ps_avx2(acc12),
+                                hsum_ps_avx2(acc13),
+                            ],
+                        ]
+                    };
+
+                    while d < dim {
+                        let qv = unsafe { [*q0_ptr.add(d), *q1_ptr.add(d)] };
+                        let cv = unsafe {
+                            [
+                                *c0_ptr.add(d),
+                                *c1_ptr.add(d),
+                                *c2_ptr.add(d),
+                                *c3_ptr.add(d),
+                            ]
+                        };
+                        for qi in 0..2 {
+                            for cj in 0..4 {
+                                dots[qi][cj] += qv[qi] * cv[cj];
+                            }
+                        }
+                        d += 1;
+                    }
+
+                    let hn = [
+                        centroid_half_norm_sq[c],
+                        centroid_half_norm_sq[c + 1],
+                        centroid_half_norm_sq[c + 2],
+                        centroid_half_norm_sq[c + 3],
+                    ];
+                    for (qi, dot_row) in dots.iter().enumerate() {
+                        let slot = ql + qi;
+                        for (cj, &dot) in dot_row.iter().enumerate() {
+                            let score = hn[cj] - dot;
+                            if score < best_scores[slot] {
+                                best_scores[slot] = score;
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    best_ids[slot] = (c + cj) as u32;
+                                }
+                            }
+                        }
+                    }
+
+                    c += 4;
+                }
+
+                while c < c_blk_end {
+                    let c_ptr = unsafe { centroids.as_ptr().add(c * dim) };
+                    let mut acc0 = _mm256_setzero_ps();
+                    let mut acc1 = _mm256_setzero_ps();
+                    let mut d = 0usize;
+                    while d + 8 <= dim {
+                        unsafe {
+                            let vc = _mm256_loadu_ps(c_ptr.add(d));
+                            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(q0_ptr.add(d)), vc, acc0);
+                            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(q1_ptr.add(d)), vc, acc1);
+                        }
+                        d += 8;
+                    }
+                    let mut s = unsafe { [hsum_ps_avx2(acc0), hsum_ps_avx2(acc1)] };
+                    while d < dim {
+                        let cv = unsafe { *c_ptr.add(d) };
+                        s[0] += unsafe { *q0_ptr.add(d) } * cv;
+                        s[1] += unsafe { *q1_ptr.add(d) } * cv;
+                        d += 1;
+                    }
+                    let hn = centroid_half_norm_sq[c];
+                    for (qi, &dot) in s.iter().enumerate() {
+                        let slot = ql + qi;
+                        let score = hn - dot;
+                        if score < best_scores[slot] {
+                            best_scores[slot] = score;
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                best_ids[slot] = c as u32;
+                            }
+                        }
+                    }
+                    c += 1;
+                }
+
+                ql += 2;
+            }
+
+            while ql < q_count {
+                let q_ptr = unsafe { queries.as_ptr().add((q_base + ql) * dim) };
+                for (c, &hn) in centroid_half_norm_sq
+                    .iter()
+                    .enumerate()
+                    .take(c_blk_end)
+                    .skip(c_blk)
+                {
+                    let c_ptr = unsafe { centroids.as_ptr().add(c * dim) };
+                    let mut acc = _mm256_setzero_ps();
+                    let mut d = 0usize;
+                    while d + 8 <= dim {
+                        unsafe {
+                            acc = _mm256_fmadd_ps(
+                                _mm256_loadu_ps(q_ptr.add(d)),
+                                _mm256_loadu_ps(c_ptr.add(d)),
+                                acc,
+                            );
+                        }
+                        d += 8;
+                    }
+                    let mut dot = unsafe { hsum_ps_avx2(acc) };
+                    while d < dim {
+                        dot += unsafe { *q_ptr.add(d) * *c_ptr.add(d) };
+                        d += 1;
+                    }
+                    let score = hn - dot;
+                    if score < best_scores[ql] {
+                        best_scores[ql] = score;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            best_ids[ql] = c as u32;
+                        }
+                    }
+                }
+                ql += 1;
+            }
+
+            c_blk = c_blk_end;
+        }
+
+        out_clusters[q_base..q_base + q_count].copy_from_slice(&best_ids[..q_count]);
+        q_base += q_count;
+    }
+}

@@ -18,6 +18,22 @@ use crate::format::{checked_align_up_64, FORMAT_KIND_OSI, FORMAT_VERSION_V1, OSP
 #[cfg(not(target_endian = "little"))]
 compile_error!("OspreyDB binary formats require a little-endian target architecture");
 
+/// `OsiHeader::flags` bit indicating that stored `centroids_f16` reside in unrotated padded
+/// space (so cluster probing uses `q_padded` and only intra-cluster residuals are FWHT-rotated).
+pub const OSI_FLAG_UNROTATED_CENTROIDS: u8 = 0x02;
+
+/// `OsiHeader::flags` bit indicating 4-bit `RaBitQ` quantization stored in transposed
+/// 32-vector FastScan (`vpshufb`) blocks instead of 1-bit `u64` words.
+pub const OSI_FLAG_RABITQ_4BIT: u8 = 0x04;
+
+/// `OsiHeader::flags` bit (paired with [`OSI_FLAG_RABITQ_4BIT`]) indicating progressive bitplane
+/// 4-bit layout for high-dimensional indexes (`padded_dim >= 512`): MSB plane `b3` (`1-bit`)
+/// packed contiguously first per cluster, followed by `[b2, b1, b0]` (`3-bit` extension).
+pub const OSI_FLAG_RABITQ_PROGRESSIVE: u8 = 0x08;
+
+/// Number of vectors packed per transposed 4-bit FastScan (`vpshufb`) block.
+pub const FASTSCAN_BLOCK_SIZE: usize = 32;
+
 /// Fixed 64-byte header of a `.osi` index file (`0x00..0x3F`).
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
@@ -113,6 +129,29 @@ impl OsiHeader {
     #[inline]
     pub fn seal_checksum(&mut self) {
         self.header_xxh64 = self.compute_header_xxh64();
+    }
+
+    /// Returns the `RaBitQ` quantization bit-width (`1` or `4`) encoded in `flags`.
+    #[inline]
+    pub const fn rabitq_bits(&self) -> u8 {
+        if (self.flags & OSI_FLAG_RABITQ_4BIT) != 0 {
+            4
+        } else {
+            1
+        }
+    }
+
+    /// Returns `true` when this `.osi` index stores 4-bit `RaBitQ` quantization.
+    #[inline]
+    pub const fn is_4bit(&self) -> bool {
+        (self.flags & OSI_FLAG_RABITQ_4BIT) != 0
+    }
+
+    /// Returns `true` when this `.osi` index stores bitplane-sliced progressive 4-bit `RaBitQ`.
+    #[inline]
+    pub const fn is_progressive_4bit(&self) -> bool {
+        (self.flags & (OSI_FLAG_RABITQ_4BIT | OSI_FLAG_RABITQ_PROGRESSIVE))
+            == (OSI_FLAG_RABITQ_4BIT | OSI_FLAG_RABITQ_PROGRESSIVE)
     }
 
     /// Validates magic bytes, format kind, version, `header_xxh64`, dimensions, and 64B offsets.
@@ -327,39 +366,10 @@ impl<'a> OsiClusterView<'a> {
         vector_count: usize,
         padded_dim: u16,
     ) -> OspreyResult<Self> {
-        if padded_dim < 64 || !padded_dim.is_power_of_two() {
-            return Err(OspreyError::InvalidDimension {
-                dim: usize::from(padded_dim),
-            });
-        }
+        let codes_bytes = cluster_codes_bytes_for_bits(vector_count, padded_dim, 1)?;
+        let (entries_offset, entries_bytes, needed, _) =
+            cluster_layout_parts(codes_bytes, vector_count)?;
         ensure_aligned_64(bytes)?;
-        let words_per_vec = usize::from(padded_dim) / 64;
-        let codes_bytes = vector_count
-            .checked_mul(words_per_vec)
-            .and_then(|w| w.checked_mul(size_of::<u64>()))
-            .ok_or(OspreyError::AllocationFailed {
-                size: usize::MAX,
-                align: CACHE_LINE_ALIGN,
-            })?;
-        let entries_offset =
-            checked_align_up_64(codes_bytes).ok_or(OspreyError::AllocationFailed {
-                size: usize::MAX,
-                align: CACHE_LINE_ALIGN,
-            })?;
-        let entries_bytes = vector_count
-            .checked_mul(size_of::<RabitqEntryHeader>())
-            .ok_or(OspreyError::AllocationFailed {
-                size: usize::MAX,
-                align: CACHE_LINE_ALIGN,
-            })?;
-        let needed =
-            entries_offset
-                .checked_add(entries_bytes)
-                .ok_or(OspreyError::BufferTooSmall {
-                    needed: usize::MAX,
-                    actual: bytes.len(),
-                })?;
-
         if bytes.len() < needed {
             return Err(OspreyError::BufferTooSmall {
                 needed,
@@ -367,6 +377,7 @@ impl<'a> OsiClusterView<'a> {
             });
         }
 
+        let words_per_vec = usize::from(padded_dim) / 64;
         let codes: &'a [u64] = bytemuck::try_cast_slice(&bytes[..codes_bytes])
             .map_err(|err| map_pod_cast_err(err, &bytes[..codes_bytes]))?;
         let entries_slice = &bytes[entries_offset..entries_offset + entries_bytes];
@@ -381,21 +392,108 @@ impl<'a> OsiClusterView<'a> {
     }
 }
 
-/// Returns the 64-byte-aligned byte span required for one cluster block (`codes + entries`).
-pub fn cluster_block_bytes(vector_count: usize, padded_dim: u16) -> OspreyResult<usize> {
+/// Zero-copy view over one cluster's transposed 32-vector 4-bit FastScan blocks and entry headers.
+#[derive(Copy, Clone, Debug)]
+pub struct OsiClusterView4Bit<'a> {
+    /// Contiguous transposed 4-bit FastScan blocks (`num_blocks * 16 * padded_dim` bytes).
+    pub blocks: &'a [u8],
+    /// Contiguous `RabitqEntryHeader` metadata records (`vector_count` elements).
+    pub entries: &'a [RabitqEntryHeader],
+    /// Number of 32-vector FastScan blocks in this cluster.
+    pub num_blocks: usize,
+}
+
+impl<'a> OsiClusterView4Bit<'a> {
+    /// Parses a contiguous 4-bit FastScan cluster block (`[blocks (pad 64B) | entries (pad 64B)]`)
+    /// zero-copy.
+    pub fn from_cluster_bytes(
+        bytes: &'a [u8],
+        vector_count: usize,
+        padded_dim: u16,
+    ) -> OspreyResult<Self> {
+        let codes_bytes = cluster_codes_bytes_for_bits(vector_count, padded_dim, 4)?;
+        let (entries_offset, entries_bytes, needed, _) =
+            cluster_layout_parts(codes_bytes, vector_count)?;
+        ensure_aligned_64(bytes)?;
+        if bytes.len() < needed {
+            return Err(OspreyError::BufferTooSmall {
+                needed,
+                actual: bytes.len(),
+            });
+        }
+
+        let num_blocks = vector_count.div_ceil(FASTSCAN_BLOCK_SIZE);
+        let blocks = &bytes[..codes_bytes];
+        let entries_slice = &bytes[entries_offset..entries_offset + entries_bytes];
+        let entries: &'a [RabitqEntryHeader] = bytemuck::try_cast_slice(entries_slice)
+            .map_err(|err| map_pod_cast_err(err, entries_slice))?;
+
+        Ok(Self {
+            blocks,
+            entries,
+            num_blocks,
+        })
+    }
+}
+
+/// Returns the byte length of one 32-vector 4-bit FastScan block (`16 * padded_dim`, always `% 64 == 0`).
+#[inline]
+pub fn fastscan_block_bytes(padded_dim: u16) -> OspreyResult<usize> {
     if padded_dim < 64 || !padded_dim.is_power_of_two() {
         return Err(OspreyError::InvalidDimension {
             dim: usize::from(padded_dim),
         });
     }
-    let words_per_vec = usize::from(padded_dim) / 64;
-    let codes_bytes = vector_count
-        .checked_mul(words_per_vec)
-        .and_then(|w| w.checked_mul(size_of::<u64>()))
+    usize::from(padded_dim)
+        .checked_mul(FASTSCAN_BLOCK_SIZE / 2)
         .ok_or(OspreyError::AllocationFailed {
             size: usize::MAX,
             align: CACHE_LINE_ALIGN,
-        })?;
+        })
+}
+
+/// Returns the unpadded code-section byte size for `vector_count` vectors at `bits` (`1` or `4`).
+pub fn cluster_codes_bytes_for_bits(
+    vector_count: usize,
+    padded_dim: u16,
+    bits: u8,
+) -> OspreyResult<usize> {
+    if padded_dim < 64 || !padded_dim.is_power_of_two() {
+        return Err(OspreyError::InvalidDimension {
+            dim: usize::from(padded_dim),
+        });
+    }
+    match bits {
+        1 => {
+            let words_per_vec = usize::from(padded_dim) / 64;
+            vector_count
+                .checked_mul(words_per_vec)
+                .and_then(|w| w.checked_mul(size_of::<u64>()))
+                .ok_or(OspreyError::AllocationFailed {
+                    size: usize::MAX,
+                    align: CACHE_LINE_ALIGN,
+                })
+        }
+        4 => {
+            let num_blocks = vector_count.div_ceil(FASTSCAN_BLOCK_SIZE);
+            let block_bytes = fastscan_block_bytes(padded_dim)?;
+            num_blocks
+                .checked_mul(block_bytes)
+                .ok_or(OspreyError::AllocationFailed {
+                    size: usize::MAX,
+                    align: CACHE_LINE_ALIGN,
+                })
+        }
+        other => Err(OspreyError::InvalidDimension {
+            dim: usize::from(other),
+        }),
+    }
+}
+
+fn cluster_layout_parts(
+    codes_bytes: usize,
+    vector_count: usize,
+) -> OspreyResult<(usize, usize, usize, usize)> {
     let entries_offset = checked_align_up_64(codes_bytes).ok_or(OspreyError::AllocationFailed {
         size: usize::MAX,
         align: CACHE_LINE_ALIGN,
@@ -406,13 +504,119 @@ pub fn cluster_block_bytes(vector_count: usize, padded_dim: u16) -> OspreyResult
             size: usize::MAX,
             align: CACHE_LINE_ALIGN,
         })?;
-    let total = entries_offset
-        .checked_add(entries_bytes)
-        .and_then(checked_align_up_64)
-        .ok_or(OspreyError::AllocationFailed {
-            size: usize::MAX,
-            align: CACHE_LINE_ALIGN,
-        })?;
+    let needed =
+        entries_offset
+            .checked_add(entries_bytes)
+            .ok_or(OspreyError::AllocationFailed {
+                size: usize::MAX,
+                align: CACHE_LINE_ALIGN,
+            })?;
+    let total = checked_align_up_64(needed).ok_or(OspreyError::AllocationFailed {
+        size: usize::MAX,
+        align: CACHE_LINE_ALIGN,
+    })?;
+    Ok((entries_offset, entries_bytes, needed, total))
+}
+
+/// Returns the unpadded code-section byte size for `vector_count` vectors matching `flags`.
+pub fn cluster_codes_bytes_for_flags(
+    vector_count: usize,
+    padded_dim: u16,
+    flags: u8,
+) -> OspreyResult<usize> {
+    if padded_dim < 64 || !padded_dim.is_power_of_two() {
+        return Err(OspreyError::InvalidDimension {
+            dim: usize::from(padded_dim),
+        });
+    }
+    if (flags & OSI_FLAG_RABITQ_4BIT) == 0 {
+        return cluster_codes_bytes_for_bits(vector_count, padded_dim, 1);
+    }
+    if (flags & OSI_FLAG_RABITQ_PROGRESSIVE) != 0 {
+        let words_per_vec = usize::from(padded_dim) / 64;
+        return vector_count
+            .checked_mul(words_per_vec)
+            .and_then(|w| w.checked_mul(4 * size_of::<u64>()))
+            .ok_or(OspreyError::AllocationFailed {
+                size: usize::MAX,
+                align: CACHE_LINE_ALIGN,
+            });
+    }
+    cluster_codes_bytes_for_bits(vector_count, padded_dim, 4)
+}
+
+/// Returns the 64-byte-aligned byte span required for one cluster block matching `flags`.
+pub fn cluster_block_bytes_for_flags(
+    vector_count: usize,
+    padded_dim: u16,
+    flags: u8,
+) -> OspreyResult<usize> {
+    let codes_bytes = cluster_codes_bytes_for_flags(vector_count, padded_dim, flags)?;
+    let (_, _, _, total) = cluster_layout_parts(codes_bytes, vector_count)?;
+    Ok(total)
+}
+
+/// Zero-copy view over one cluster's progressive bitplane 4-bit `RaBitQ` data and entry headers.
+#[derive(Copy, Clone, Debug)]
+pub struct OsiClusterViewProgressive4Bit<'a> {
+    /// Contiguous MSB (`b3`) 1-bit `u64` words (`vector_count * words_per_vec`).
+    pub plane3: &'a [u64],
+    /// Contiguous `[b2, b1, b0]` 3-bit extension `u64` words (`vector_count * 3 * words_per_vec`).
+    pub low_planes: &'a [u64],
+    /// Contiguous `RabitqEntryHeader` metadata records (`vector_count` elements).
+    pub entries: &'a [RabitqEntryHeader],
+    /// `u64` words per vector per bitplane (`padded_dim / 64`).
+    pub words_per_vec: usize,
+}
+
+impl<'a> OsiClusterViewProgressive4Bit<'a> {
+    /// Parses a progressive bitplane 4-bit cluster block (`[codes (pad 64B) | entries (pad 64B)]`).
+    pub fn from_cluster_bytes(
+        bytes: &'a [u8],
+        vector_count: usize,
+        padded_dim: u16,
+    ) -> OspreyResult<Self> {
+        let flags = OSI_FLAG_RABITQ_4BIT | OSI_FLAG_RABITQ_PROGRESSIVE;
+        let codes_bytes = cluster_codes_bytes_for_flags(vector_count, padded_dim, flags)?;
+        let (entries_offset, entries_bytes, needed, _) =
+            cluster_layout_parts(codes_bytes, vector_count)?;
+        ensure_aligned_64(bytes)?;
+        if bytes.len() < needed {
+            return Err(OspreyError::BufferTooSmall {
+                needed,
+                actual: bytes.len(),
+            });
+        }
+        let words_per_vec = usize::from(padded_dim) / 64;
+        let all_words: &'a [u64] = bytemuck::try_cast_slice(&bytes[..codes_bytes])
+            .map_err(|err| map_pod_cast_err(err, &bytes[..codes_bytes]))?;
+        let plane3_words = vector_count.saturating_mul(words_per_vec);
+        let (plane3, low_planes) = all_words.split_at(plane3_words);
+        let entries_slice = &bytes[entries_offset..entries_offset + entries_bytes];
+        let entries: &'a [RabitqEntryHeader] = bytemuck::try_cast_slice(entries_slice)
+            .map_err(|err| map_pod_cast_err(err, entries_slice))?;
+        Ok(Self {
+            plane3,
+            low_planes,
+            entries,
+            words_per_vec,
+        })
+    }
+}
+
+/// Returns the 64-byte-aligned byte span required for one 1-bit cluster block (`codes + entries`).
+pub fn cluster_block_bytes(vector_count: usize, padded_dim: u16) -> OspreyResult<usize> {
+    cluster_block_bytes_for_bits(vector_count, padded_dim, 1)
+}
+
+/// Returns the 64-byte-aligned byte span required for one cluster block at `bits` (`1` or `4`).
+pub fn cluster_block_bytes_for_bits(
+    vector_count: usize,
+    padded_dim: u16,
+    bits: u8,
+) -> OspreyResult<usize> {
+    let codes_bytes = cluster_codes_bytes_for_bits(vector_count, padded_dim, bits)?;
+    let (_, _, _, total) = cluster_layout_parts(codes_bytes, vector_count)?;
     Ok(total)
 }
 

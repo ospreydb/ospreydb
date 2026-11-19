@@ -20,15 +20,18 @@ pub mod traits;
 pub use aligned::{ensure_aligned_64, AlignedBuffer, CACHE_LINE_ALIGN};
 pub use cluster::{
     binarize_rotated_vectors, fit_binary_kmeans, fit_binary_kmeans_from_rotated,
-    fit_binary_kmeans_from_rotated_with_init, init_kmeans_plusplus_1bit,
+    fit_binary_kmeans_from_rotated_with_init, init_kmeans_plusplus_1bit, kmeans_subsample_target,
     preprocess_and_binarize_batch, BinaryKMeansConfig, BinaryKMeansKernel, BinaryKMeansResult,
-    ScalarClusterKernel,
+    ScalarClusterKernel, KMEANS_POINTS_PER_CENTROID, KMEANS_SUBSAMPLE_MIN,
 };
 pub use error::{OspreyError, OspreyResult};
 pub use format::osi::{
     cast_centroids_f16, cast_centroids_f16_mut, centroids_padded_bytes, centroids_unpadded_bytes,
-    cluster_block_bytes, deserialize_tombstone_footer, serialize_tombstone_footer, OsiClusterSpan,
-    OsiClusterView, OsiHeader, RabitqEntryHeader,
+    cluster_block_bytes, cluster_block_bytes_for_bits, cluster_block_bytes_for_flags,
+    cluster_codes_bytes_for_bits, cluster_codes_bytes_for_flags, deserialize_tombstone_footer,
+    fastscan_block_bytes, serialize_tombstone_footer, OsiClusterSpan, OsiClusterView,
+    OsiClusterView4Bit, OsiClusterViewProgressive4Bit, OsiHeader, RabitqEntryHeader,
+    FASTSCAN_BLOCK_SIZE, OSI_FLAG_RABITQ_4BIT, OSI_FLAG_RABITQ_PROGRESSIVE,
 };
 pub use format::osr::{cast_doc_token_ranges, DocTokenRange, OsrHeader};
 pub use format::osv::{cast_minipage_directory, MinipageDirectoryEntry, OsvHeader};
@@ -45,15 +48,17 @@ pub use lutrank::{
     OSR_TOKEN_BYTES,
 };
 pub use rabitq::{
-    dot_f32_f16_scalar, encode_prerotated_rabitq_residual,
-    encode_prerotated_rabitq_residual_in_place, encode_rabitq_residual,
-    encode_rabitq_residual_scalar, OsiIndex, OsiMappedIndex, OsiMappedView, ProbedCluster,
-    RabitqEncodedResidual, RabitqFwhtKernel, RabitqScanKernel, ScalarRabitqKernel,
-    TransposedQuery4Bit, VectorLocation, OSI_FLAG_UNROTATED_CENTROIDS, QUERY_QUANT_EPS,
-    RABITQ_F16_MAX_CLAMP, RABITQ_L1_MIN_NORMAL_F32, RABITQ_NORM_EPS,
+    dot_f32_f16_scalar, encode_prerotated_rabitq_4bit_in_place, encode_prerotated_rabitq_residual,
+    encode_prerotated_rabitq_residual_in_place, encode_rabitq_4bit_residual,
+    encode_rabitq_residual, encode_rabitq_residual_scalar, quantize_4bit_unit_residual,
+    rabitq_4bit_fastscan_block_scalar, FastScanQueryLut4Bit, OsiIndex, OsiMappedIndex,
+    OsiMappedView, ProbedCluster, RabitqEncodedResidual, RabitqFwhtKernel, RabitqScanKernel,
+    ScalarRabitqKernel, TransposedQuery4Bit, VectorLocation, OSI_FLAG_UNROTATED_CENTROIDS,
+    QUERY_QUANT_EPS, RABITQ_F16_MAX_CLAMP, RABITQ_L1_MIN_NORMAL_F32, RABITQ_NORM_EPS,
 };
 pub use search::{
     ResolvedSearchPlan, SearchOptions, DEFAULT_LOW_DIM_OVERSAMPLE_MULTIPLIER,
+    FOUR_BIT_HIGH_DIM_DEFAULT_CANDIDATES, FOUR_BIT_LOW_DIM_DEFAULT_CANDIDATES,
     LOW_DIM_OVERSAMPLE_THRESHOLD, LOW_DIM_REFINE_POOL,
 };
 pub use topk::{BoundedTopKHeap, ScoredCandidate};

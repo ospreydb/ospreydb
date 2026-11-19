@@ -18,6 +18,43 @@ use crate::math::{
     padded_dimension, prepare_and_pad_vector, RademacherSigns, SplitMix64, F32_SIGN_BIT_MASK,
 };
 
+/// Minimum training sample size before subsampling engages (`65_536`).
+pub const KMEANS_SUBSAMPLE_MIN: usize = 65_536;
+
+/// Target number of training vectors per centroid (`64`, yielding `65_536` for `K = 1024`).
+pub const KMEANS_POINTS_PER_CENTROID: usize = 64;
+
+/// Returns the deterministic training subsample size `min(N, max(65536, 64 * K))`.
+#[inline]
+pub fn kmeans_subsample_target(num_vectors: usize, num_clusters: usize) -> usize {
+    let target = KMEANS_SUBSAMPLE_MIN.max(num_clusters.saturating_mul(KMEANS_POINTS_PER_CENTROID));
+    num_vectors.min(target)
+}
+
+/// Selects `sample_len` sorted deterministic indices from `0..total` using Knuth's Algorithm S.
+fn deterministic_subsample_indices(total: usize, sample_len: usize, seed: u64) -> Vec<usize> {
+    if sample_len >= total {
+        return (0..total).collect();
+    }
+    let mut rng = SplitMix64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+    let mut indices = Vec::with_capacity(sample_len);
+    let mut selected = 0usize;
+    for i in 0..total {
+        let rem_needed = sample_len - selected;
+        if rem_needed == 0 {
+            break;
+        }
+        let rem_total = total - i;
+        let rem_u64 = u64::try_from(rem_total).unwrap_or(1);
+        let r = usize::try_from(rng.next_u64() % rem_u64).unwrap_or(0);
+        if r < rem_needed {
+            indices.push(i);
+            selected += 1;
+        }
+    }
+    indices
+}
+
 /// Hardware-accelerated or scalar kernel hooks consumed by `1-Bit Binary K-Means`.
 ///
 /// Implemented by [`ScalarClusterKernel`] in `osprey-core` and by all `SimdBackend`
@@ -477,17 +514,24 @@ pub fn init_kmeans_plusplus_1bit<K: BinaryKMeansKernel + ?Sized>(
 
         let new_centroid = &centroids[dst_start..dst_start + words_per_vec];
         #[cfg(not(miri))]
-        min_dist_sq
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, slot)| {
-                let vec_bits = &packed_vectors[i * words_per_vec..(i + 1) * words_per_vec];
-                let d = u64::from(simd.hamming_distance_u64(vec_bits, new_centroid));
-                let d_sq = d * d;
-                if d_sq < *slot {
-                    *slot = d_sq;
-                }
-            });
+        {
+            const INIT_CHUNK: usize = 4096;
+            min_dist_sq
+                .par_chunks_mut(INIT_CHUNK)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base = chunk_idx * INIT_CHUNK;
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        let i = base + offset;
+                        let vec_bits = &packed_vectors[i * words_per_vec..(i + 1) * words_per_vec];
+                        let d = u64::from(simd.hamming_distance_u64(vec_bits, new_centroid));
+                        let d_sq = d * d;
+                        if d_sq < *slot {
+                            *slot = d_sq;
+                        }
+                    }
+                });
+        }
         #[cfg(miri)]
         for (i, slot) in min_dist_sq.iter_mut().enumerate() {
             let vec_bits = &packed_vectors[i * words_per_vec..(i + 1) * words_per_vec];
@@ -746,25 +790,33 @@ fn run_1bit_kmeans_loop<K: BinaryKMeansKernel + ?Sized>(
 
         // Lock-free thread-local accumulation + Majority Vote update.
         #[cfg(not(miri))]
-        let mut accum = packed_vectors
-            .par_chunks(words_per_vec)
-            .zip(assignments.par_iter())
-            .zip(point_distances.par_iter())
-            .fold(
-                || UpdateAccum::new(k, padded_dim),
-                |mut local, ((vec_bits, &assign), &dist)| {
-                    let c = usize::try_from(assign).unwrap_or(0);
-                    if c < k {
-                        local.cluster_sizes[c] = local.cluster_sizes[c].saturating_add(1);
-                        local.cluster_inertia[c] =
-                            local.cluster_inertia[c].saturating_add(u64::from(dist));
-                        let row = &mut local.bit_counts[c * padded_dim..(c + 1) * padded_dim];
-                        accumulate_vector_bits(row, vec_bits);
+        let accum = {
+            let chunk_vecs =
+                (num_vectors / (rayon::current_num_threads().max(1) * 2)).clamp(256, 4096);
+            packed_vectors
+                .par_chunks(chunk_vecs * words_per_vec)
+                .zip(assignments.par_chunks(chunk_vecs))
+                .zip(point_distances.par_chunks(chunk_vecs))
+                .map(|((vec_chunk, assign_chunk), dist_chunk)| {
+                    let mut local = UpdateAccum::new(k, padded_dim);
+                    for ((vec_bits, &assign), &dist) in vec_chunk
+                        .chunks_exact(words_per_vec)
+                        .zip(assign_chunk.iter())
+                        .zip(dist_chunk.iter())
+                    {
+                        let c = usize::try_from(assign).unwrap_or(0);
+                        if c < k {
+                            local.cluster_sizes[c] = local.cluster_sizes[c].saturating_add(1);
+                            local.cluster_inertia[c] =
+                                local.cluster_inertia[c].saturating_add(u64::from(dist));
+                            let row = &mut local.bit_counts[c * padded_dim..(c + 1) * padded_dim];
+                            accumulate_vector_bits(row, vec_bits);
+                        }
                     }
                     local
-                },
-            )
-            .reduce(|| UpdateAccum::new(k, padded_dim), UpdateAccum::merge);
+                })
+                .reduce(|| UpdateAccum::new(k, padded_dim), UpdateAccum::merge)
+        };
         #[cfg(miri)]
         let mut accum = {
             let mut local = UpdateAccum::new(k, padded_dim);
@@ -784,6 +836,8 @@ fn run_1bit_kmeans_loop<K: BinaryKMeansKernel + ?Sized>(
             }
             local
         };
+        #[cfg(not(miri))]
+        let mut accum = accum;
 
         for c in 0..k {
             let count = accum.cluster_sizes[c];
@@ -912,11 +966,13 @@ fn validate_fit_inputs(num_vectors: usize, k: usize) -> OspreyResult<()> {
 }
 
 /// Runs the complete `1-Bit Binary K-Means` training pipeline over raw `f32` vectors:
-/// 1. Parallel FWHT rotation + 1-bit packing (`32x` training RAM reduction);
-/// 2. Deterministic `1-Bit K-Means++` initialization;
-/// 3. Parallel 1-bit assignment, thread-local majority-vote update, empty cluster splitting,
+/// 1. Deterministic subsampling of `min(N, max(65536, 256 * K))` vectors for centroid training;
+/// 2. Parallel FWHT rotation + 1-bit packing (`32x` training RAM reduction);
+/// 3. Deterministic `1-Bit K-Means++` initialization;
+/// 4. Parallel 1-bit assignment, thread-local majority-vote update, empty cluster splitting,
 ///    and early stopping;
-/// 4. Final exact `f64`-accumulated `f16` centroid materialization in a 64B-aligned buffer.
+/// 5. Exact `f64`-accumulated `f16` centroid materialization in a 64B-aligned buffer;
+/// 6. Parallel SIMD assignment of all `N` input vectors to the trained centroids.
 pub fn fit_binary_kmeans<K: BinaryKMeansKernel + ?Sized>(
     vectors: &[f32],
     num_vectors: usize,
@@ -927,124 +983,294 @@ pub fn fit_binary_kmeans<K: BinaryKMeansKernel + ?Sized>(
 ) -> OspreyResult<BinaryKMeansResult> {
     let k = config.num_clusters;
     validate_fit_inputs(num_vectors, k)?;
+    let expected_len = num_vectors
+        .checked_mul(orig_dim)
+        .ok_or(OspreyError::InvalidDimension { dim: num_vectors })?;
+    if vectors.len() < expected_len {
+        return Err(OspreyError::BufferTooSmall {
+            needed: expected_len * std::mem::size_of::<f32>(),
+            actual: std::mem::size_of_val(vectors),
+        });
+    }
+
     let padded_dim = padded_dimension(orig_dim)?;
     let words_per_vec = padded_dim / 64;
+    let train_n = kmeans_subsample_target(num_vectors, k);
 
-    // Rotate + binarize batch into 1-bit `[u64; words_per_vec]` (32x RAM savings).
-    let packed_bits =
-        preprocess_and_binarize_batch(vectors, num_vectors, orig_dim, fwht_seed, simd)?;
+    let signs = RademacherSigns::from_seed(padded_dim, fwht_seed)?;
+    let xor_masks = signs.xor_masks();
 
-    // Deterministic 1-Bit K-Means++.
-    let init_centroids = init_kmeans_plusplus_1bit(
-        &packed_bits,
-        num_vectors,
-        words_per_vec,
-        k,
-        config.seed,
-        simd,
-    )?;
+    if train_n == num_vectors {
+        // Full-corpus training path (`N <= max(65536, 256 * K)`).
+        let packed_bits =
+            preprocess_and_binarize_batch(vectors, num_vectors, orig_dim, fwht_seed, simd)?;
+        let init_centroids = init_kmeans_plusplus_1bit(
+            &packed_bits,
+            num_vectors,
+            words_per_vec,
+            k,
+            config.seed,
+            simd,
+        )?;
+        let loop_out = run_1bit_kmeans_loop(
+            &packed_bits,
+            num_vectors,
+            padded_dim,
+            init_centroids,
+            config,
+            simd,
+        )?;
 
-    // Iterative 1-bit clustering loop.
+        let (sums, counts) = materialize_raw_sums(
+            vectors,
+            &loop_out.assignments,
+            &(0..num_vectors).collect::<Vec<_>>(),
+            orig_dim,
+            padded_dim,
+            k,
+            xor_masks,
+            simd,
+        )?;
+        let centroids_f16 = finalize_centroids_f16(
+            sums,
+            &counts,
+            &loop_out.binary_centroids,
+            k,
+            padded_dim,
+            config.spherical,
+        )?;
+
+        return Ok(BinaryKMeansResult {
+            centroids_f16,
+            binary_centroids: loop_out.binary_centroids,
+            assignments: loop_out.assignments,
+            final_hamming_inertia: loop_out.final_hamming_inertia,
+            iterations_run: loop_out.iterations_run,
+        });
+    }
+
+    // Subsampled training path (`N > max(65536, 256 * K)`).
+    let sample_indices = deterministic_subsample_indices(num_vectors, train_n, config.seed);
+    let mut train_bits = vec![0_u64; train_n * words_per_vec];
+    #[cfg(not(miri))]
+    train_bits
+        .par_chunks_mut(words_per_vec)
+        .zip(sample_indices.par_iter())
+        .try_for_each_init(
+            || vec![0.0_f32; padded_dim],
+            |scratch, (out_words, &src_idx)| -> OspreyResult<()> {
+                let src = &vectors[src_idx * orig_dim..(src_idx + 1) * orig_dim];
+                prepare_and_pad_vector(src, scratch)?;
+                simd.fwht_rotate_in_place(scratch, xor_masks)?;
+                pack_f32_signs_le(scratch, out_words);
+                Ok(())
+            },
+        )?;
+    #[cfg(miri)]
+    {
+        let mut scratch = vec![0.0_f32; padded_dim];
+        for (out_words, &src_idx) in train_bits
+            .chunks_mut(words_per_vec)
+            .zip(sample_indices.iter())
+        {
+            let src = &vectors[src_idx * orig_dim..(src_idx + 1) * orig_dim];
+            prepare_and_pad_vector(src, &mut scratch)?;
+            simd.fwht_rotate_in_place(&mut scratch, xor_masks)?;
+            pack_f32_signs_le(&scratch, out_words);
+        }
+    }
+
+    let init_centroids =
+        init_kmeans_plusplus_1bit(&train_bits, train_n, words_per_vec, k, config.seed, simd)?;
     let loop_out = run_1bit_kmeans_loop(
-        &packed_bits,
-        num_vectors,
+        &train_bits,
+        train_n,
         padded_dim,
         init_centroids,
         config,
         simd,
     )?;
+    drop(train_bits);
 
-    // Single final parallel pass over raw vectors -> exact `f64` sums -> `f16` centroids.
-    let signs = RademacherSigns::from_seed(padded_dim, fwht_seed)?;
-    let xor_masks = signs.xor_masks();
-
-    struct MatState {
-        sums: Vec<f64>,
-        counts: Vec<u64>,
-        scratch: Vec<f32>,
-    }
-
-    #[cfg(not(miri))]
-    let final_acc = loop_out
-        .assignments
-        .par_iter()
-        .enumerate()
-        .try_fold(
-            || MatState {
-                sums: vec![0.0_f64; k * padded_dim],
-                counts: vec![0_u64; k],
-                scratch: vec![0.0_f32; padded_dim],
-            },
-            |mut st, (i, &assign)| -> OspreyResult<MatState> {
-                let c = usize::try_from(assign).unwrap_or(0);
-                let src = &vectors[i * orig_dim..(i + 1) * orig_dim];
-                prepare_and_pad_vector(src, &mut st.scratch)?;
-                simd.fwht_rotate_in_place(&mut st.scratch, xor_masks)?;
-                st.counts[c] += 1;
-                let dst_row = &mut st.sums[c * padded_dim..(c + 1) * padded_dim];
-                for (dst, &val) in dst_row.iter_mut().zip(st.scratch.iter()) {
-                    *dst += f64::from(val);
-                }
-                Ok(st)
-            },
-        )
-        .try_reduce(
-            || MatState {
-                sums: vec![0.0_f64; k * padded_dim],
-                counts: vec![0_u64; k],
-                scratch: Vec::new(),
-            },
-            |mut a, b| -> OspreyResult<MatState> {
-                for (sa, &sb) in a.sums.iter_mut().zip(b.sums.iter()) {
-                    *sa += sb;
-                }
-                for (ca, &cb) in a.counts.iter_mut().zip(b.counts.iter()) {
-                    *ca += cb;
-                }
-                Ok(a)
-            },
-        )?;
-    #[cfg(miri)]
-    let final_acc = {
-        let mut st = MatState {
-            sums: vec![0.0_f64; k * padded_dim],
-            counts: vec![0_u64; k],
-            scratch: vec![0.0_f32; padded_dim],
-        };
-        for (i, &assign) in loop_out.assignments.iter().enumerate() {
-            let c = usize::try_from(assign).unwrap_or(0);
-            let src = &vectors[i * orig_dim..(i + 1) * orig_dim];
-            prepare_and_pad_vector(src, &mut st.scratch)?;
-            simd.fwht_rotate_in_place(&mut st.scratch, xor_masks)?;
-            st.counts[c] += 1;
-            let dst_row = &mut st.sums[c * padded_dim..(c + 1) * padded_dim];
-            for (dst, &val) in dst_row.iter_mut().zip(st.scratch.iter()) {
-                *dst += f64::from(val);
-            }
-        }
-        st
-    };
-
+    let (sums, counts) = materialize_raw_sums(
+        vectors,
+        &loop_out.assignments,
+        &sample_indices,
+        orig_dim,
+        padded_dim,
+        k,
+        xor_masks,
+        simd,
+    )?;
     let centroids_f16 = finalize_centroids_f16(
-        final_acc.sums,
-        &final_acc.counts,
+        sums,
+        &counts,
         &loop_out.binary_centroids,
         k,
         padded_dim,
         config.spherical,
     )?;
 
+    // Parallel SIMD assignment of all `N` vectors against the trained binary centroids.
+    let (assignments, final_hamming_inertia) = assign_all_raw_vectors_simd(
+        vectors,
+        num_vectors,
+        orig_dim,
+        padded_dim,
+        words_per_vec,
+        xor_masks,
+        &loop_out.binary_centroids,
+        k,
+        simd,
+    )?;
+
     Ok(BinaryKMeansResult {
         centroids_f16,
         binary_centroids: loop_out.binary_centroids,
-        assignments: loop_out.assignments,
-        final_hamming_inertia: loop_out.final_hamming_inertia,
+        assignments,
+        final_hamming_inertia,
         iterations_run: loop_out.iterations_run,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn materialize_raw_sums<K: BinaryKMeansKernel + ?Sized>(
+    vectors: &[f32],
+    assignments: &[u32],
+    indices: &[usize],
+    orig_dim: usize,
+    padded_dim: usize,
+    k: usize,
+    xor_masks: &[u32],
+    simd: &K,
+) -> OspreyResult<(Vec<f64>, Vec<u64>)> {
+    #[cfg(not(miri))]
+    {
+        let chunk_len =
+            (indices.len() / (rayon::current_num_threads().max(1) * 2)).clamp(256, 4096);
+        indices
+            .par_chunks(chunk_len)
+            .zip(assignments.par_chunks(chunk_len))
+            .map(
+                |(idx_chunk, assign_chunk)| -> OspreyResult<(Vec<f64>, Vec<u64>)> {
+                    let mut sums = vec![0.0_f64; k * padded_dim];
+                    let mut counts = vec![0_u64; k];
+                    let mut scratch = vec![0.0_f32; padded_dim];
+                    for (&src_idx, &assign) in idx_chunk.iter().zip(assign_chunk.iter()) {
+                        let c = usize::try_from(assign).unwrap_or(0);
+                        let src = &vectors[src_idx * orig_dim..(src_idx + 1) * orig_dim];
+                        prepare_and_pad_vector(src, &mut scratch)?;
+                        simd.fwht_rotate_in_place(&mut scratch, xor_masks)?;
+                        counts[c] += 1;
+                        let dst_row = &mut sums[c * padded_dim..(c + 1) * padded_dim];
+                        for (dst, &val) in dst_row.iter_mut().zip(scratch.iter()) {
+                            *dst += f64::from(val);
+                        }
+                    }
+                    Ok((sums, counts))
+                },
+            )
+            .try_reduce(
+                || (vec![0.0_f64; k * padded_dim], vec![0_u64; k]),
+                |(mut sa, mut ca), (sb, cb)| {
+                    for (a, &b) in sa.iter_mut().zip(sb.iter()) {
+                        *a += b;
+                    }
+                    for (a, &b) in ca.iter_mut().zip(cb.iter()) {
+                        *a += b;
+                    }
+                    Ok((sa, ca))
+                },
+            )
+    }
+    #[cfg(miri)]
+    {
+        let mut sums = vec![0.0_f64; k * padded_dim];
+        let mut counts = vec![0_u64; k];
+        let mut scratch = vec![0.0_f32; padded_dim];
+        for (&src_idx, &assign) in indices.iter().zip(assignments.iter()) {
+            let c = usize::try_from(assign).unwrap_or(0);
+            let src = &vectors[src_idx * orig_dim..(src_idx + 1) * orig_dim];
+            prepare_and_pad_vector(src, &mut scratch)?;
+            simd.fwht_rotate_in_place(&mut scratch, xor_masks)?;
+            counts[c] += 1;
+            let dst_row = &mut sums[c * padded_dim..(c + 1) * padded_dim];
+            for (dst, &val) in dst_row.iter_mut().zip(scratch.iter()) {
+                *dst += f64::from(val);
+            }
+        }
+        Ok((sums, counts))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assign_all_raw_vectors_simd<K: BinaryKMeansKernel + ?Sized>(
+    vectors: &[f32],
+    num_vectors: usize,
+    orig_dim: usize,
+    padded_dim: usize,
+    words_per_vec: usize,
+    xor_masks: &[u32],
+    binary_centroids: &[u64],
+    k: usize,
+    simd: &K,
+) -> OspreyResult<(Vec<u32>, u64)> {
+    let mut assignments = vec![0_u32; num_vectors];
+
+    #[cfg(not(miri))]
+    let total_inertia = {
+        let chunk_vecs = (num_vectors / (rayon::current_num_threads().max(1) * 4)).clamp(256, 4096);
+        assignments
+            .par_chunks_mut(chunk_vecs)
+            .enumerate()
+            .map(|(chunk_idx, assign_chunk)| -> OspreyResult<u64> {
+                let base_i = chunk_idx * chunk_vecs;
+                let mut scratch = vec![0.0_f32; padded_dim];
+                let mut bits = vec![0_u64; words_per_vec];
+                let mut local_inertia = 0_u64;
+                for (offset, slot) in assign_chunk.iter_mut().enumerate() {
+                    let i = base_i + offset;
+                    let src = &vectors[i * orig_dim..(i + 1) * orig_dim];
+                    prepare_and_pad_vector(src, &mut scratch)?;
+                    simd.fwht_rotate_in_place(&mut scratch, xor_masks)?;
+                    pack_f32_signs_le(&scratch, &mut bits);
+                    let (best_idx, best_dist) = simd.batch_nearest_binary_centroid(
+                        &bits,
+                        binary_centroids,
+                        words_per_vec,
+                        k,
+                    );
+                    *slot = u32::try_from(best_idx).unwrap_or(0);
+                    local_inertia = local_inertia.saturating_add(u64::from(best_dist));
+                }
+                Ok(local_inertia)
+            })
+            .try_reduce(|| 0_u64, |a, b| Ok(a.saturating_add(b)))?
+    };
+
+    #[cfg(miri)]
+    let total_inertia = {
+        let mut scratch = vec![0.0_f32; padded_dim];
+        let mut bits = vec![0_u64; words_per_vec];
+        let mut local_inertia = 0_u64;
+        for (i, slot) in assignments.iter_mut().enumerate() {
+            let src = &vectors[i * orig_dim..(i + 1) * orig_dim];
+            prepare_and_pad_vector(src, &mut scratch)?;
+            simd.fwht_rotate_in_place(&mut scratch, xor_masks)?;
+            pack_f32_signs_le(&scratch, &mut bits);
+            let (best_idx, best_dist) =
+                simd.batch_nearest_binary_centroid(&bits, binary_centroids, words_per_vec, k);
+            *slot = u32::try_from(best_idx).unwrap_or(0);
+            local_inertia = local_inertia.saturating_add(u64::from(best_dist));
+        }
+        local_inertia
+    };
+
+    Ok((assignments, total_inertia))
+}
+
 /// Runs `1-Bit Binary K-Means` on already FWHT-rotated `f32` vectors (`[num_vectors, padded_dim]`)
-/// using deterministic `1-Bit K-Means++` initialization.
+/// using deterministic `1-Bit K-Means++` initialization (subsampling when `N > max(65536, 256*K)`).
 pub fn fit_binary_kmeans_from_rotated<K: BinaryKMeansKernel + ?Sized>(
     rotated_vectors: &[f32],
     num_vectors: usize,
@@ -1054,25 +1280,148 @@ pub fn fit_binary_kmeans_from_rotated<K: BinaryKMeansKernel + ?Sized>(
 ) -> OspreyResult<BinaryKMeansResult> {
     let k = config.num_clusters;
     validate_fit_inputs(num_vectors, k)?;
-    let packed_bits = binarize_rotated_vectors(rotated_vectors, num_vectors, padded_dim)?;
+    if padded_dim < 64 || !padded_dim.is_power_of_two() || padded_dim > 65_536 {
+        return Err(OspreyError::InvalidDimension { dim: padded_dim });
+    }
+    let expected_floats = num_vectors
+        .checked_mul(padded_dim)
+        .ok_or(OspreyError::InvalidDimension { dim: num_vectors })?;
+    if rotated_vectors.len() < expected_floats {
+        return Err(OspreyError::BufferTooSmall {
+            needed: expected_floats * std::mem::size_of::<f32>(),
+            actual: std::mem::size_of_val(rotated_vectors),
+        });
+    }
+
+    let train_n = kmeans_subsample_target(num_vectors, k);
     let words_per_vec = padded_dim / 64;
-    let init_centroids = init_kmeans_plusplus_1bit(
-        &packed_bits,
-        num_vectors,
-        words_per_vec,
-        k,
-        config.seed,
-        simd,
-    )?;
-    fit_binary_kmeans_from_rotated_with_init(
-        rotated_vectors,
-        &packed_bits,
-        num_vectors,
+
+    if train_n == num_vectors {
+        let packed_bits = binarize_rotated_vectors(rotated_vectors, num_vectors, padded_dim)?;
+        let init_centroids = init_kmeans_plusplus_1bit(
+            &packed_bits,
+            num_vectors,
+            words_per_vec,
+            k,
+            config.seed,
+            simd,
+        )?;
+        return fit_binary_kmeans_from_rotated_with_init(
+            rotated_vectors,
+            &packed_bits,
+            num_vectors,
+            padded_dim,
+            init_centroids,
+            config,
+            simd,
+        );
+    }
+
+    let sample_indices = deterministic_subsample_indices(num_vectors, train_n, config.seed);
+    let mut train_bits = vec![0_u64; train_n * words_per_vec];
+    #[cfg(not(miri))]
+    train_bits
+        .par_chunks_mut(words_per_vec)
+        .zip(sample_indices.par_iter())
+        .for_each(|(out_words, &src_idx)| {
+            let src = &rotated_vectors[src_idx * padded_dim..(src_idx + 1) * padded_dim];
+            pack_f32_signs_le(src, out_words);
+        });
+    #[cfg(miri)]
+    for (out_words, &src_idx) in train_bits
+        .chunks_mut(words_per_vec)
+        .zip(sample_indices.iter())
+    {
+        let src = &rotated_vectors[src_idx * padded_dim..(src_idx + 1) * padded_dim];
+        pack_f32_signs_le(src, out_words);
+    }
+
+    let init_centroids =
+        init_kmeans_plusplus_1bit(&train_bits, train_n, words_per_vec, k, config.seed, simd)?;
+    let loop_out = run_1bit_kmeans_loop(
+        &train_bits,
+        train_n,
         padded_dim,
         init_centroids,
         config,
         simd,
-    )
+    )?;
+    drop(train_bits);
+
+    let mut sums = vec![0.0_f64; k * padded_dim];
+    let mut counts = vec![0_u64; k];
+    for (&src_idx, &assign) in sample_indices.iter().zip(loop_out.assignments.iter()) {
+        let c = usize::try_from(assign).unwrap_or(0);
+        counts[c] += 1;
+        let src = &rotated_vectors[src_idx * padded_dim..(src_idx + 1) * padded_dim];
+        let dst_row = &mut sums[c * padded_dim..(c + 1) * padded_dim];
+        for (dst, &val) in dst_row.iter_mut().zip(src.iter()) {
+            *dst += f64::from(val);
+        }
+    }
+    let centroids_f16 = finalize_centroids_f16(
+        sums,
+        &counts,
+        &loop_out.binary_centroids,
+        k,
+        padded_dim,
+        config.spherical,
+    )?;
+
+    let mut assignments = vec![0_u32; num_vectors];
+    #[cfg(not(miri))]
+    let final_hamming_inertia: u64 = {
+        let chunk_vecs = (num_vectors / (rayon::current_num_threads().max(1) * 4)).clamp(256, 4096);
+        assignments
+            .par_chunks_mut(chunk_vecs)
+            .enumerate()
+            .map(|(chunk_idx, assign_chunk)| {
+                let base_i = chunk_idx * chunk_vecs;
+                let mut bits = vec![0_u64; words_per_vec];
+                let mut local_inertia = 0_u64;
+                for (offset, slot) in assign_chunk.iter_mut().enumerate() {
+                    let i = base_i + offset;
+                    let src = &rotated_vectors[i * padded_dim..(i + 1) * padded_dim];
+                    pack_f32_signs_le(src, &mut bits);
+                    let (best_idx, best_dist) = simd.batch_nearest_binary_centroid(
+                        &bits,
+                        &loop_out.binary_centroids,
+                        words_per_vec,
+                        k,
+                    );
+                    *slot = u32::try_from(best_idx).unwrap_or(0);
+                    local_inertia = local_inertia.saturating_add(u64::from(best_dist));
+                }
+                local_inertia
+            })
+            .sum()
+    };
+    #[cfg(miri)]
+    let final_hamming_inertia: u64 = {
+        let mut bits = vec![0_u64; words_per_vec];
+        let mut total = 0_u64;
+        for (i, slot) in assignments.iter_mut().enumerate() {
+            let src = &rotated_vectors[i * padded_dim..(i + 1) * padded_dim];
+            pack_f32_signs_le(src, &mut bits);
+            let (best_idx, best_dist) = simd.batch_nearest_binary_centroid(
+                &bits,
+                &loop_out.binary_centroids,
+                words_per_vec,
+                k,
+            );
+            *slot = u32::try_from(best_idx).unwrap_or(0);
+            total = total.saturating_add(u64::from(best_dist));
+        }
+        total
+    };
+
+    Ok(BinaryKMeansResult {
+        centroids_f16,
+        binary_centroids: loop_out.binary_centroids,
+        assignments,
+        final_hamming_inertia,
+        iterations_run: loop_out.iterations_run,
+    })
 }
 
 /// Runs `1-Bit Binary K-Means` on already-rotated `f32` vectors and pre-packed `1-bit` vectors
@@ -1286,5 +1635,40 @@ mod tests {
 
         // No NaNs or Infs in materialized f16 centroids.
         assert!(res.centroids_f16.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn subsampled_kmeans_target_and_deterministic_subsample_fit() {
+        assert_eq!(kmeans_subsample_target(10_000, 256), 10_000);
+        assert_eq!(kmeans_subsample_target(1_000_000, 64), 65_536);
+        assert_eq!(kmeans_subsample_target(1_000_000, 1024), 65_536);
+        assert_eq!(kmeans_subsample_target(1_000_000, 2048), 131_072);
+
+        // Verify deterministic_subsample_indices returns sorted unique indices of exact count
+        let idx_a = deterministic_subsample_indices(100_000, 1024, 0x1234);
+        let idx_b = deterministic_subsample_indices(100_000, 1024, 0x1234);
+        assert_eq!(idx_a, idx_b);
+        assert_eq!(idx_a.len(), 1024);
+        assert!(idx_a.windows(2).all(|w| w[0] < w[1]));
+
+        // Run fit_binary_kmeans above KMEANS_SUBSAMPLE_MIN (70_000 vectors, 64d, K=8)
+        let n = 70_000usize;
+        let dim = 64usize;
+        let k = 8usize;
+        let vectors = make_synthetic_vectors(n, dim, 0x5566_7788);
+        let mut cfg = BinaryKMeansConfig::new(k);
+        cfg.max_iters = 8;
+        let kernel = ScalarClusterKernel;
+
+        let res1 = fit_binary_kmeans(&vectors, n, dim, 0x4F53_5052_0001, &cfg, &kernel).unwrap();
+        let res2 = fit_binary_kmeans(&vectors, n, dim, 0x4F53_5052_0001, &cfg, &kernel).unwrap();
+        assert_eq!(res1.assignments.len(), n);
+        assert_eq!(res1.assignments, res2.assignments);
+        assert_eq!(res1.binary_centroids, res2.binary_centroids);
+        assert!(res1
+            .assignments
+            .iter()
+            .all(|&c| usize::try_from(c).unwrap() < k));
     }
 }
