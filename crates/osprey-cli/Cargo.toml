@@ -1,0 +1,49 @@
+[package]
+name = "osprey-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+readme.workspace = true
+description = "OspreyDB 100% CLI binary for deterministic Parquet/JSONL ingestion, vector search, CPU LUT-Rank reranking, artifact inspection, and TCO benchmarking."
+keywords = ["vector-search", "cli", "rag", "colbert", "parquet"]
+categories.workspace = true
+
+[[bin]]
+name = "osprey-cli"
+path = "src/main.rs"
+
+[dependencies]
+osprey-core.workspace = true
+osprey-simd.workspace = true
+osprey-storage.workspace = true
+arrow.workspace = true
+bytemuck.workspace = true
+bytes.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+comfy-table.workspace = true
+futures.workspace = true
+half.workspace = true
+indicatif.workspace = true
+memmap2.workspace = true
+object_store.workspace = true
+rayon.workspace = true
+roaring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+xxhash-rust.workspace = true
+yansi.workspace = true
+
+[dev-dependencies]
+parquet.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,47 @@
+# OspreyDB Dependency Security & License Policy (`cargo-deny`)
+
+[graph]
+all-features = true
+no-default-features = false
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "workspace"
+ignore = [
+    { id = "RUSTSEC-2026-0391", reason = "parquet 53.4.1 caps zstd-sys < 2.0.14; OspreyDB uses bulk Zstd on page_xxh64-verified frames" },
+    { id = "RUSTSEC-2026-0403", reason = "parquet 53.4.1 caps zstd-sys < 2.0.14; zstd::bulk API is unaffected per advisory" },
+    { id = "RUSTSEC-2026-0410", reason = "wasm32-only allocator shim; OspreyDB targets native x86_64/aarch64 hosts only" },
+    { id = "RUSTSEC-2026-0194", reason = "object_store 0.11.2 locks quick-xml ^0.37.0; upgrade tracked with object_store major bump" },
+    { id = "RUSTSEC-2026-0195", reason = "object_store 0.11.2 locks quick-xml ^0.37.0; upgrade tracked with object_store major bump" },
+    { id = "RUSTSEC-2026-0435", reason = "parquet 53.4.1 locks thrift ^0.17; used only for offline Parquet metadata ingestion" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

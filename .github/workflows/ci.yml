@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  governance-and-lint:
+    name: Governance, Format, Clippy, Docs & Fuzz Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify required governance artifacts
+        run: |
+          set -euo pipefail
+          required_files=(
+            "AGENTS.md"
+            "ARCHITECTURE.md"
+            "LICENSE"
+            "rust-toolchain.toml"
+            "rustfmt.toml"
+          )
+          for f in "${required_files[@]}"; do
+            if [ ! -s "$f" ]; then
+              echo "::error::Missing or empty governance file: $f"
+              exit 1
+            fi
+          done
+
+          shopt -s nullglob
+          rfc_files=(rfcs/*.md)
+          adr_files=(adr/*.md)
+          if [ ${#rfc_files[@]} -eq 0 ]; then
+            echo "::error::No RFC documents found under rfcs/"
+            exit 1
+          fi
+          if [ ${#adr_files[@]} -eq 0 ]; then
+            echo "::error::No ADR documents found under adr/"
+            exit 1
+          fi
+          echo "All governance artifacts verified (${#rfc_files[@]} RFCs, ${#adr_files[@]} ADRs)."
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rustdoc check
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
+
+      - name: Fuzz targets check
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
+      - name: Python mathematical reference verification
+        run: python3 reference/poc_reference.py
+
+  test-matrix:
+    name: Test Matrix (${{ matrix.label }})
+    needs: governance-and-lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: ubuntu-24.04-arm
+            label: linux-aarch64
+          - os: macos-14
+            label: macos-arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run release test suite (default target flags)
+        run: cargo test --workspace --release -- --nocapture
+
+      - name: Run release test suite (target-cpu=native / x86-64-v3)
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.arch }}" = "X64" ]; then
+            RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --workspace --release -- --nocapture
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            RUSTFLAGS="-C target-cpu=apple-m1" cargo test --workspace --release -- --nocapture
+          else
+            RUSTFLAGS="-C target-cpu=native" cargo test --workspace --release -- --nocapture
+          fi
+
+  miri:
+    name: Miri UB & Pointer Alignment Verification
+    needs: governance-and-lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+
+      - name: Run Miri test suite
+        run: |
+          set -euo pipefail
+          cargo +nightly miri test -p osprey-core -p osprey-simd -p osprey-storage --lib
+          cargo +nightly miri test -p osprey-core --test binary_contracts --test lutrank_golden --test rabitq_golden
+          cargo +nightly miri test -p osprey-simd --test fwht_golden_validation
+
+  cargo-deny:
+    name: Dependency Security & License Audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run cargo-deny audit
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources

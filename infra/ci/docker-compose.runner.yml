@@ -1,7 +1,7 @@
 services:
   github-runner:
     image: myoung34/github-runner:latest
-    container_name: osprey-pro-github-runner
+    container_name: osprey-github-runner
     restart: unless-stopped
     env_file:
       - path: .env
@@ -10,10 +10,10 @@ services:
       REPO_URL: ${REPO_URL:-https://github.com/ospreydb/ospreydb}
       ACCESS_TOKEN: ${ACCESS_TOKEN:-}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-}
-      RUNNER_NAME: ${RUNNER_NAME:-osprey-pro-local-builder}
+      RUNNER_NAME: ${RUNNER_NAME:-osprey-local-builder}
       RUNNER_WORKDIR: /tmp/runner/work
       RUNNER_GROUP: ${RUNNER_GROUP:-default}
-      LABELS: ${RUNNER_LABELS:-self-hosted,linux,x64,osprey-pro-builder}
+      LABELS: ${RUNNER_LABELS:-self-hosted,linux,x64,osprey-builder}
       EPHEMERAL: "false"
       DISABLE_AUTO_UPDATE: "false"
       # Persistent Rust toolchain, Cargo registry, and sccache compilation cache
@@ -23,9 +23,6 @@ services:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
-      # Optional read-only token for fetching private ospreydb/osprey-engine crates (unless set via GitHub Secret OSPREY_ENGINE_TOKEN / OSPREY_CORE_TOKEN)
-      OSPREY_ENGINE_TOKEN: ${OSPREY_ENGINE_TOKEN:-}
-      OSPREY_CORE_TOKEN: ${OSPREY_CORE_TOKEN:-}
     volumes:
       # Docker-out-of-Docker for Buildx multi-arch Distroless image builds
       - /var/run/docker.sock:/var/run/docker.sock
@@ -43,8 +40,8 @@ services:
 
 volumes:
   cargo-cache:
-    name: osprey-pro-cargo-cache
+    name: osprey-cargo-cache
   sccache-cache:
-    name: osprey-pro-sccache
+    name: osprey-sccache
   runner-work:
-    name: osprey-pro-runner-work
+    name: osprey-runner-work

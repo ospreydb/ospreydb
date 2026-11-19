@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: General Questions & Community Support
+    url: https://github.com/ospreydb/ospreydb/discussions
+    about: Ask usage questions, share benchmark results, or discuss indexing/tuning parameters.
+  - name: Security Vulnerabilities
+    url: https://github.com/ospreydb/ospreydb/blob/main/SECURITY.md
+    about: Report memory safety, parser, or checksum issues privately via email before opening a public issue.

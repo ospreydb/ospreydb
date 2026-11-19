@@ -1,53 +1,77 @@
-//! `osprey` production daemon hosting Apache Arrow Flight (`:8815`),
-//! Drop-In Qdrant/Cohere HTTP & Prometheus `/metrics` (`:6333`), built-in
-//! `/v1/embeddings` (OpenAI-compatible), offline Ed25519 license verification,
-//! WAL/LSM Delta Buffer, and CoW Compactor.
+//! Unified `osprey` binary (100% Apache-2.0):
+//! - Production daemon (`osprey serve`): Apache Arrow Flight (`:8815`),
+//!   Drop-In Qdrant/Cohere HTTP & Prometheus `/metrics` (`:6333`), built-in
+//!   `/v1/embeddings` (OpenAI-compatible), WAL/LSM Delta Buffer, and CoW Compactor.
+//! - Engine & Storage CLI (`import`, `search`, `rerank`, `delete`, `inspect`,
+//!   `bench`, `doctor`, `completions`, `wal-stress`).
 
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
+use osprey_cli::cli::{
+    BenchArgs, CompletionsArgs, DeleteArgs, DoctorArgs, ImportArgs, InspectArgs, RerankArgs,
+    SearchArgs,
+};
+use osprey_cli::commands;
+use osprey_cli::output::{self, CliContext, CliError, CliResult};
 use osprey_core::math::padded_dimension;
-use osprey_core::{ProCapability, RawVectorRecord};
+use osprey_core::RawVectorRecord;
+use osprey_simd::{active_simd_backend, detect_best_simd_level, SimdLevel};
 use osprey_storage::{
     build_object_store, MinipageLruCache, RangePlannerConfig, RemoteStoreConfig,
     DEFAULT_MINIPAGE_CACHE_BYTES,
 };
 use ospreydb::{
-    current_unix_secs, serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder,
-    EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
-    ManifestStore, OfflineLicenseVerifier, OspreyFlightService, OspreyLicense, OspreyWal,
-    ProEngineError, ProMetricsRegistry, ProResult, TombstoneGarbageCollector, TombstoneGcConfig,
-    VectorQuotaState, WalConfig, WalRecoveryMode, WalSyncPolicy, DEFAULT_ARROW_FLIGHT_ADDR,
-    DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
+    serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder, EmbedderConfig,
+    HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker, ManifestStore,
+    OspreyFlightService, OspreyWal, ProEngineError, ProMetricsRegistry, ProResult,
+    TombstoneGarbageCollector, TombstoneGcConfig, WalConfig, WalRecoveryMode, WalSyncPolicy,
+    DEFAULT_ARROW_FLIGHT_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
 };
+use serde::Serialize;
 use tokio::sync::Notify;
+use yansi::{Condition, Paint};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum NodeRole {
-    /// Single-node unified writer + reader + compactor (allowed on free Community Tier up to 5M vectors).
+    /// Single-node unified writer + reader + compactor.
     #[default]
     Unified,
-    /// Dedicated distributed writer + compactor node (requires Pro/Enterprise license).
+    /// Dedicated distributed writer + compactor node.
     Writer,
-    /// Stateless distributed reader node polling S3 manifest.json (requires Pro/Enterprise license).
+    /// Stateless distributed reader node polling S3 manifest.json.
     Reader,
 }
 
 #[derive(Debug, Parser)]
 #[command(
     name = "osprey",
-    about = "OspreyDB Vector Database Server (Arrow Flight, Qdrant/Cohere Drop-In, Auto-Embeddings, WAL/LSM & S3 CAS)",
-    version
+    about = "OspreyDB: 1-Bit RAM Index + Zstd S3 Slabs + LUT-Rank Vector Database (Server & CLI)",
+    version,
+    after_help = "Examples:\n  osprey serve --data-dir ./data --s3-uri file:///tmp/osprey-s3\n  osprey import --input corpus.parquet --output ./out --with-lutrank\n  osprey search --index ./out/segment.osi --slabs ./out/segment.osv --query '[0.1, -0.2, ...]' -k 10\n  osprey doctor\n  osprey bench --vectors 20000 --dim 384 --with-lutrank"
 )]
 struct Cli {
+    /// Emit structured JSON output to stdout (for CLI subcommands).
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Rayon worker thread pool size (`0` = auto-detect logical CPU cores).
+    #[arg(long, global = true, default_value_t = 0)]
+    threads: usize,
+
+    /// Diagnostic verbosity level on stderr (`-v`, `-vv`).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -57,25 +81,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start the OspreyDB HTTP (:6333) + Arrow Flight (:8815) + WAL/LSM + S3 CAS server.
     Serve(Box<ServeArgs>),
-    Activate(ActivateArgs),
+    /// Ingest local or remote Parquet/JSONL/NPY datasets into `.osi`, `.osv`, and optional `.osr` segments.
+    Import(ImportArgs),
+    /// Run vector search (Stage-1 `.osi` mmap + Stage-2 DP-coalesced `.osv` + Stage-3 exact f16 + optional `.osr` LUT-Rank).
+    Search(SearchArgs),
+    /// Rerank candidate document IDs strictly on CPU using `.osr` LUT-Rank SIMD kernels.
+    Rerank(RerankArgs),
+    /// Atomically add tombstones for deleted `doc_id`s into an existing `.osi` index.
+    Delete(DeleteArgs),
+    /// Inspect headers, compression ratios, minipage distributions, tombstones, and xxHash64 integrity.
+    Inspect(InspectArgs),
+    /// Run reproducible scientific benchmark and AWS cloud FinOps TCO projection.
+    Bench(BenchArgs),
+    /// Inspect host CPU SIMD capabilities, 64-byte alignment, memory bandwidth, and S3 connectivity.
+    Doctor(DoctorArgs),
+    /// Generate shell completion scripts (`bash`, `zsh`, `fish`, `elvish`, `powershell`).
+    Completions(CompletionsArgs),
+    /// Run WAL durability stress test for crash-recovery validation.
     WalStress(WalStressArgs),
 }
 
 #[derive(Debug, Args)]
-struct ActivateArgs {
-    #[arg(long)]
-    license: String,
-
-    #[arg(long)]
-    output: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
 struct ServeArgs {
-    #[arg(long, env = "OSPREY_PRO_LICENSE")]
-    license: Option<String>,
-
     #[arg(long, value_enum, default_value_t = NodeRole::Unified, env = "OSPREY_ROLE")]
     role: NodeRole,
 
@@ -149,85 +178,24 @@ struct WalStressArgs {
     batch_size: usize,
 }
 
-fn default_license_path() -> ProResult<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        ProEngineError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "HOME environment variable is not set",
-        ))
-    })?;
-    Ok(PathBuf::from(home).join(".osprey").join("license.key"))
+#[derive(Debug, Serialize)]
+struct JsonErrorPayload {
+    error: String,
+    exit_code: u8,
 }
 
-fn load_license_token(explicit: Option<&str>) -> ProResult<Option<String>> {
-    if let Some(tok) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(Some(tok.to_owned()));
+fn build_cli_version() -> &'static str {
+    match detect_best_simd_level() {
+        SimdLevel::Avx512 => concat!(env!("CARGO_PKG_VERSION"), " (simd: avx512_vpopcntdq)"),
+        SimdLevel::Avx2 => concat!(env!("CARGO_PKG_VERSION"), " (simd: avx2)"),
+        SimdLevel::Neon => concat!(env!("CARGO_PKG_VERSION"), " (simd: neon)"),
+        SimdLevel::Scalar => concat!(env!("CARGO_PKG_VERSION"), " (simd: scalar)"),
     }
-    if let Ok(path) = default_license_path() {
-        if path.exists() {
-            let contents = std::fs::read_to_string(&path)?;
-            let trimmed = contents.trim();
-            if !trimmed.is_empty() {
-                tracing::info!(path = %path.display(), "loaded persisted license key");
-                return Ok(Some(trimmed.to_owned()));
-            }
-        }
-    }
-    Ok(None)
 }
 
-fn run_activate(args: ActivateArgs) -> ProResult<()> {
-    let token = args.license.trim();
-    let verifier = OfflineLicenseVerifier::new()?;
-    let lic = verifier.verify_now(token)?;
-    let now_secs = current_unix_secs()?;
-
-    let out_path = match args.output {
-        Some(p) => p,
-        None => default_license_path()?,
-    };
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&out_path, format!("{token}\n"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    if lic.is_in_grace_period_at(now_secs) {
-        tracing::warn!(
-            org = %lic.customer_org,
-            tier = %lic.tier,
-            expires_at = lic.expires_at,
-            grace_days_remaining = lic.grace_days_remaining_at(now_secs),
-            "activated license is expired and inside the 30-day renewal grace period"
-        );
-    }
-    println!(
-        "Activated OspreyDB Pro license for '{}' (tier={}, max_vectors={}, saved to {})",
-        lic.customer_org,
-        lic.tier,
-        if lic.is_unlimited_vectors() {
-            "unlimited".to_owned()
-        } else {
-            lic.max_vectors.to_string()
-        },
-        out_path.display()
-    );
-    Ok(())
-}
-
-fn validate_role_license(role: NodeRole, active_license: Option<&OspreyLicense>) -> ProResult<()> {
-    if matches!(role, NodeRole::Writer | NodeRole::Reader)
-        && active_license.is_none_or(|lic| lic.tier.eq_ignore_ascii_case("community"))
-    {
-        return Err(ProEngineError::InvalidConfig(
-            "Distributed multi-node roles (--role writer / --role reader) require an OspreyDB Pro or Enterprise license (OSPREY_PRO_LICENSE). Use --role unified for the free Community Tier (up to 5M vectors).",
-        ));
-    }
-    Ok(())
+fn build_cli_command() -> clap::Command {
+    let ver = build_cli_version();
+    Cli::command().version(ver).long_version(ver)
 }
 
 fn resolve_wal_path(data_dir: Option<&PathBuf>, wal_path: Option<&PathBuf>) -> PathBuf {
@@ -259,6 +227,14 @@ async fn shutdown_signal() -> ProResult<()> {
     }
 }
 
+fn run_serve_blocking(args: ServeArgs) -> ProResult<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(ProEngineError::Io)?;
+    rt.block_on(run_serve(args))
+}
+
 async fn run_serve(args: ServeArgs) -> ProResult<()> {
     let embedder_config = EmbedderConfig {
         embed_url: args.embed_url.unwrap_or_default(),
@@ -267,44 +243,6 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         batch_size: args.embed_batch_size,
     };
     let embedder = Arc::new(Embedder::new(embedder_config));
-
-    let verifier = OfflineLicenseVerifier::new()?;
-    let license_token = load_license_token(args.license.as_deref())?;
-    let active_license = if let Some(token) = &license_token {
-        let now_secs = current_unix_secs()?;
-        let lic = verifier.verify_now(token)?;
-        let _ = verifier.verify_and_activate(token, now_secs)?;
-        if lic.is_in_grace_period_at(now_secs) {
-            let days_left = lic.grace_days_remaining_at(now_secs);
-            tracing::warn!(
-                org = %lic.customer_org,
-                tier = %lic.tier,
-                expires_at = lic.expires_at,
-                grace_deadline = lic.grace_deadline(),
-                grace_days_remaining = days_left,
-                "OspreyDB Pro license expired; running inside 30-day renewal grace period ({days_left} days remaining before Pro startup is blocked)"
-            );
-        } else {
-            tracing::info!(
-                org = %lic.customer_org,
-                tier = %lic.tier,
-                max_nodes = lic.max_nodes,
-                max_vectors = lic.max_vectors,
-                unlimited_vectors = lic.is_unlimited_vectors(),
-                arrow_flight = lic.has_capability(ProCapability::ArrowFlight),
-                "verified offline Ed25519 commercial license"
-            );
-        }
-        Some(lic)
-    } else {
-        tracing::info!(
-            max_vectors = ospreydb::COMMUNITY_MAX_VECTORS,
-            "Single-Node Community Tier — no license key supplied (5M vector limit, local storage)"
-        );
-        None
-    };
-
-    validate_role_license(args.role, active_license.as_ref())?;
 
     if let Some(ref data_dir) = args.data_dir {
         std::fs::create_dir_all(data_dir)?;
@@ -410,30 +348,22 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
 
     let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED)?);
     let initial_vectors = engine.total_live_vector_count()?;
-    let quota = VectorQuotaState::with_initial_vectors(initial_vectors);
-    if let Some(lic) = active_license {
-        quota.activate_license(lic);
-    } else if initial_vectors >= ospreydb::COMMUNITY_MAX_VECTORS {
-        tracing::warn!(
-            total_vectors = initial_vectors,
-            max_vectors = ospreydb::COMMUNITY_MAX_VECTORS,
-            "Community Tier 5M vector limit reached; node remains online in read/search-only mode for vectors"
-        );
-    }
+    let vector_counter = Arc::new(AtomicU64::new(initial_vectors));
 
     let is_reader = args.role == NodeRole::Reader;
-    let http_state = HttpServerState::with_quota(
+    let http_state = HttpServerState::with_vector_counter(
         Arc::clone(&reranker),
         embedder,
         Arc::clone(&metrics),
-        quota.clone(),
+        Arc::clone(&vector_counter),
     )
     .with_api_key(args.api_key)
     .with_read_only(is_reader);
     http_state.register_collection(&args.collection, Arc::clone(&engine))?;
 
-    let flight_service = OspreyFlightService::with_quota(Arc::clone(&engine), reranker, quota)
-        .with_read_only(is_reader);
+    let flight_service =
+        OspreyFlightService::with_vector_counter(Arc::clone(&engine), reranker, vector_counter)
+            .with_read_only(is_reader);
 
     let shutdown_notify = Arc::new(Notify::new());
     let flight_shutdown = Arc::clone(&shutdown_notify);
@@ -565,20 +495,94 @@ fn run_wal_stress(args: WalStressArgs) -> ProResult<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let res = match cli.command {
-        Some(Command::Serve(args)) => run_serve(*args).await,
-        Some(Command::Activate(args)) => run_activate(args),
-        Some(Command::WalStress(args)) => run_wal_stress(args),
-        None => run_serve(cli.serve).await,
+fn dispatch_cli_command(command: Command, ctx: &CliContext) -> CliResult<()> {
+    if ctx.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(ctx.threads)
+            .build_global()
+            .map_err(|err| {
+                CliError::Io(format!("failed to initialize rayon thread pool: {err}"))
+            })?;
+    }
+
+    ctx.log_debug(format!(
+        "osprey initialized (simd={}, json={}, verbose={}, threads={})",
+        active_simd_backend(),
+        ctx.json,
+        ctx.verbose,
+        ctx.threads
+    ));
+
+    match command {
+        Command::Doctor(args) => commands::doctor::run(&args, ctx),
+        Command::Import(args) => commands::import::run(&args, ctx),
+        Command::Search(args) => commands::search::run(&args, ctx),
+        Command::Rerank(args) => commands::rerank::run(&args, ctx),
+        Command::Delete(args) => commands::delete::run(&args, ctx),
+        Command::Inspect(args) => commands::inspect::run(&args, ctx),
+        Command::Bench(args) => commands::bench::run(&args, ctx),
+        Command::Completions(args) => {
+            let mut cmd = build_cli_command();
+            clap_complete::generate(args.shell, &mut cmd, "osprey", &mut std::io::stdout());
+            Ok(())
+        }
+        Command::Serve(_) | Command::WalStress(_) => unreachable!("handled directly in main"),
+    }
+}
+
+fn main() -> ExitCode {
+    yansi::whenever(Condition::TTY_AND_COLOR);
+    let matches = build_cli_command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    let ctx = CliContext {
+        json: cli.json,
+        verbose: cli.verbose,
+        threads: cli.threads,
     };
-    match res {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("osprey error: {err}");
-            ExitCode::FAILURE
+
+    match cli.command {
+        Some(Command::Serve(args)) => match run_serve_blocking(*args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("osprey error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        None => match run_serve_blocking(cli.serve) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("osprey error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::WalStress(args)) => match run_wal_stress(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("osprey error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(other) => {
+            if let Err(err) = dispatch_cli_command(other, &ctx) {
+                if ctx.json {
+                    let payload = JsonErrorPayload {
+                        error: err.to_string(),
+                        exit_code: err.numeric_code(),
+                    };
+                    if let Ok(json) = serde_json::to_string_pretty(&payload) {
+                        eprintln!("{json}");
+                    } else {
+                        eprintln!(
+                            "{{\"error\":\"{err}\",\"exit_code\":{}}}",
+                            err.numeric_code()
+                        );
+                    }
+                } else {
+                    eprintln!("{} {err}", "error:".red().bright().bold());
+                }
+                return err.exit_code();
+            }
+            ExitCode::from(output::EXIT_OK)
         }
     }
 }
@@ -588,40 +592,9 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    fn sample_pro_license() -> OspreyLicense {
-        OspreyLicense {
-            customer_org: "acme".to_owned(),
-            tier: "enterprise".to_owned(),
-            max_nodes: 0,
-            max_vectors: 0,
-            issued_at: 1_794_856_000,
-            expires_at: 1_794_856_000 + 86_400 * 365,
-            features: vec!["s3_cas_manifest".to_owned()],
-        }
-    }
-
     #[test]
-    fn community_tier_blocks_distributed_writer_and_reader_roles() {
-        assert!(validate_role_license(NodeRole::Unified, None).is_ok());
-
-        let writer_err = validate_role_license(NodeRole::Writer, None).unwrap_err();
-        assert!(writer_err
-            .to_string()
-            .contains("Distributed multi-node roles (--role writer / --role reader)"));
-
-        let reader_err = validate_role_license(NodeRole::Reader, None).unwrap_err();
-        assert!(reader_err
-            .to_string()
-            .contains("Use --role unified for the free Community Tier"));
-
-        let pro = sample_pro_license();
-        assert!(validate_role_license(NodeRole::Writer, Some(&pro)).is_ok());
-        assert!(validate_role_license(NodeRole::Reader, Some(&pro)).is_ok());
-    }
-
-    #[test]
-    fn cli_parses_aliases_and_resolves_data_dir_wal_path() {
-        let cli = Cli::try_parse_from([
+    fn cli_parses_all_subcommands_including_serve_and_engine_commands() {
+        let srv = Cli::try_parse_from([
             "osprey",
             "serve",
             "--data-dir",
@@ -640,8 +613,7 @@ mod tests {
             "3",
         ])
         .unwrap();
-
-        let Some(Command::Serve(serve)) = cli.command else {
+        let Some(Command::Serve(serve)) = srv.command else {
             panic!("expected Serve subcommand");
         };
         assert_eq!(serve.role, NodeRole::Reader);
@@ -657,5 +629,81 @@ mod tests {
             resolve_wal_path(serve.data_dir.as_ref(), serve.wal_path.as_ref()),
             PathBuf::from("/tmp/osprey-data/osprey.wal")
         );
+
+        let writer = Cli::try_parse_from(["osprey", "serve", "--role", "writer"]).unwrap();
+        assert!(matches!(
+            writer.command,
+            Some(Command::Serve(ref s)) if s.role == NodeRole::Writer
+        ));
+
+        let fallback = Cli::try_parse_from(["osprey", "--data-dir", "/tmp/fallback"]).unwrap();
+        assert!(fallback.command.is_none());
+        assert_eq!(
+            fallback.serve.data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/fallback"))
+        );
+
+        let doc = Cli::try_parse_from(["osprey", "--json", "-vv", "doctor"]).unwrap();
+        assert!(doc.json);
+        assert_eq!(doc.verbose, 2);
+        assert!(matches!(doc.command, Some(Command::Doctor(_))));
+
+        let imp = Cli::try_parse_from([
+            "osprey",
+            "import",
+            "--input",
+            "data.parquet",
+            "--output",
+            "./out",
+            "--with-lutrank",
+        ])
+        .unwrap();
+        assert!(matches!(imp.command, Some(Command::Import(_))));
+
+        let srch = Cli::try_parse_from([
+            "osprey",
+            "search",
+            "--index",
+            "seg.osi",
+            "--slabs",
+            "seg.osv",
+            "--query",
+            "[0.1,0.2]",
+        ])
+        .unwrap();
+        assert!(matches!(srch.command, Some(Command::Search(_))));
+
+        let rrk = Cli::try_parse_from([
+            "osprey",
+            "rerank",
+            "--rerank-store",
+            "seg.osr",
+            "--query-tokens",
+            "[[0.1]]",
+            "--doc-ids",
+            "1,2,3",
+        ])
+        .unwrap();
+        assert!(matches!(rrk.command, Some(Command::Rerank(_))));
+
+        let del = Cli::try_parse_from(["osprey", "delete", "--index", "seg.osi", "--ids", "10,20"])
+            .unwrap();
+        assert!(matches!(del.command, Some(Command::Delete(_))));
+
+        let insp = Cli::try_parse_from(["osprey", "inspect", "-f", "seg.osi", "seg.osv"]).unwrap();
+        assert!(matches!(insp.command, Some(Command::Inspect(_))));
+
+        let bnc = Cli::try_parse_from(["osprey", "bench", "--with-lutrank"]).unwrap();
+        assert!(matches!(bnc.command, Some(Command::Bench(_))));
+
+        let comp = Cli::try_parse_from(["osprey", "completions", "bash"]).unwrap();
+        assert!(matches!(comp.command, Some(Command::Completions(_))));
+
+        let wal = Cli::try_parse_from(["osprey", "wal-stress", "--wal-path", "test.wal"]).unwrap();
+        assert!(matches!(wal.command, Some(Command::WalStress(_))));
+
+        let ver = build_cli_version();
+        assert!(ver.contains(env!("CARGO_PKG_VERSION")));
+        assert!(ver.contains(active_simd_backend()));
     }
 }

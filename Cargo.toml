@@ -1,46 +1,65 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/osprey-core",
+    "crates/osprey-simd",
+    "crates/osprey-storage",
+    "crates/osprey-cli",
     "crates/ospreydb",
-    "crates/osprey-keygen",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-license = "LicenseRef-OspreyDB-Commercial"
+license = "Apache-2.0"
 repository = "https://github.com/ospreydb/ospreydb"
+homepage = "https://ospreydb.dev"
+documentation = "https://ospreydb.dev/architecture"
+readme = "README.md"
+categories = ["database-implementations", "science", "algorithms"]
+authors = ["OspreyDB Contributors"]
 
 [workspace.dependencies]
-osprey-core = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main", version = "0.1.0" }
-osprey-simd = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main", version = "0.1.0" }
-osprey-storage = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main", version = "0.1.0" }
+osprey-core = { path = "crates/osprey-core", version = "0.1.1" }
+osprey-simd = { path = "crates/osprey-simd", version = "0.1.1" }
+osprey-storage = { path = "crates/osprey-storage", version = "0.1.1" }
+osprey-cli = { path = "crates/osprey-cli", version = "0.1.1" }
 
 arrow = "53"
 arrow-flight = "53.4"
 axum = "0.8"
 base64 = "0.22"
-bytemuck = { version = "1.19", features = ["derive"] }
+bytemuck = { version = "1.19", features = ["derive", "min_const_generics"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
-ed25519-dalek = "2.1"
+clap_complete = "4.6"
+comfy-table = { version = "7", features = ["custom_styling"] }
+crc32fast = "1.4"
 futures = "0.3"
-half = { version = "2.4", features = ["bytemuck", "std"] }
+half = { version = "2.4", features = ["bytemuck", "std", "num-traits"] }
+indicatif = "0.17"
+memmap2 = "0.9"
 object_store = { version = "0.11", features = ["aws", "gcp", "azure", "http"] }
+parquet = { version = "53", features = ["arrow", "async", "object_store"] }
 prost = "0.13"
+proptest = "1.6"
 rand = "0.8"
 rayon = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 roaring = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-crc32fast = "1.4"
+tempfile = "3"
 thiserror = "2.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tokio-stream = "0.1"
 tonic = "0.12"
 tracing = "0.1"
+url = "2"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+yansi = { version = "1", features = ["detect-tty", "detect-env"] }
+zstd = "0.13"
 
 [profile.release]
 opt-level = 3

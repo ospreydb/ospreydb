@@ -1,0 +1,61 @@
+name: Bug Report
+description: Report a bug, crash, recall regression, or checksum/alignment failure in OspreyDB
+title: "[bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Include the exact `osprey doctor` and `osprey --version` output so maintainers can reproduce hardware/SIMD behavior without back-and-forth.
+        For general usage questions or dataset tuning, use [GitHub Discussions](https://github.com/ospreydb/ospreydb/discussions).
+
+  - type: input
+    id: version
+    attributes:
+      label: osprey --version
+      description: Paste the exact output of `osprey --version` (or commit SHA if built from source).
+      placeholder: "osprey 0.1.1"
+    validations:
+      required: true
+
+  - type: input
+    id: os_arch
+    attributes:
+      label: Operating System & Architecture
+      description: OS, kernel version, and CPU model/architecture.
+      placeholder: "Ubuntu 24.04 x86_64 (AMD EPYC / AVX-512) or macOS 15 arm64 (M3)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: Output of `osprey doctor`
+      description: Run `osprey doctor` (or `osprey --json doctor`) and paste the complete output.
+      render: text
+      placeholder: |
+        Active engine        AVX-512 (512-bit ZMM: F + BW + VPOPCNTDQ)
+        Cache alignment      PASS (64-byte aligned)
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro_steps
+    attributes:
+      label: Exact Commands to Reproduce
+      description: Paste the exact CLI commands (`osprey import`, `osprey search`, `osprey serve`, `osprey inspect`, etc.) and dataset shape (`N`, `dim`, flags).
+      render: bash
+      placeholder: |
+        osprey import --input ./data.parquet --output ./segments --clusters 256
+        osprey search --index ./segments/segment.osi --slabs ./segments/segment.osv --query ./query.npy
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed vs. Expected Behavior
+      description: Include the full error message, POSIX exit code, or recall/checksum mismatch details.
+    validations:
+      required: true

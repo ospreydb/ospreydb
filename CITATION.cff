@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+title: "OspreyDB: 1-Bit RaBitQ Indexing, DP Range Coalescing, and SIMD LUT-Rank Reranking"
+message: "If you use OspreyDB in academic research or benchmarks, please cite this software using the metadata below."
+type: software
+authors:
+  - family-names: Ramos
+    given-names: Lucas
+  - name: "OspreyDB Contributors"
+version: "0.1.1"
+date-released: "2026-11-18"
+license: Apache-2.0
+repository-code: "https://github.com/ospreydb/ospreydb"
+url: "https://ospreydb.dev"
+abstract: >-
+  OspreyDB is a 100% Apache-2.0 zero-copy vector database and CPU late-interaction
+  reranking engine written in Rust for local disk and S3/object storage. It combines
+  Fast Walsh-Hadamard Transform (FWHT) rotation, 1-Bit Binary K-Means clustering,
+  asymmetric 1-bit RaBitQ scanning (.osi), TSP-ordered Zstd vector slabs accessed via
+  O(k) Dynamic Programming range coalescing (RangePlanner, .osv), and 2-bit nested-lattice
+  SIMD lookup-table ColBERT MaxSim reranking (LUT-Rank, .osr).
+keywords:
+  - vector-search
+  - rabitq
+  - range-planner
+  - lut-rank
+  - colbert
+  - simd
+  - object-storage
+  - rust

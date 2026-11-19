@@ -1,0 +1,12 @@
+.git
+target
+fuzz
+**/*.osi
+**/*.osv
+**/*.osr
+**/*.parquet
+**/*.bin
+**/*.pem
+**/*.key
+.env
+.env.*

@@ -1,0 +1,645 @@
+{
+  "schema_version": 1,
+  "endianness": "little",
+  "prng": "splitmix64",
+  "artifacts": [
+    {
+      "file": "fwht_d64.bin",
+      "total_bytes": 8200,
+      "sha256": "aa85307e501f77a9d836169b14834b09534c359309bcdcce43100ad02a15e49c",
+      "sections": [
+        {
+          "name": "sign_words",
+          "offset": 0,
+          "byte_len": 8,
+          "shape": [
+            1
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "inputs",
+          "offset": 8,
+          "byte_len": 4096,
+          "shape": [
+            16,
+            64
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "outputs",
+          "offset": 4104,
+          "byte_len": 4096,
+          "shape": [
+            16,
+            64
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "fwht",
+      "seed": "0x00004f5350520001",
+      "orig_dim": 64,
+      "padded_dim": 64,
+      "num_vectors": 16
+    },
+    {
+      "file": "fwht_d128.bin",
+      "total_bytes": 16400,
+      "sha256": "4d823d86f1b7c5265c0dbb9a9fc4d27b6cfca3a206e2d8c6d9911c7b2d27e189",
+      "sections": [
+        {
+          "name": "sign_words",
+          "offset": 0,
+          "byte_len": 16,
+          "shape": [
+            2
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "inputs",
+          "offset": 16,
+          "byte_len": 8192,
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "outputs",
+          "offset": 8208,
+          "byte_len": 8192,
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "fwht",
+      "seed": "0x00004f5350520001",
+      "orig_dim": 128,
+      "padded_dim": 128,
+      "num_vectors": 16
+    },
+    {
+      "file": "fwht_d256.bin",
+      "total_bytes": 32800,
+      "sha256": "e3037f901db8bf224f3a8824e500f5aaa25d3914cdfc89f6daa1f6b230cb1f24",
+      "sections": [
+        {
+          "name": "sign_words",
+          "offset": 0,
+          "byte_len": 32,
+          "shape": [
+            4
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "inputs",
+          "offset": 32,
+          "byte_len": 16384,
+          "shape": [
+            16,
+            256
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "outputs",
+          "offset": 16416,
+          "byte_len": 16384,
+          "shape": [
+            16,
+            256
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "fwht",
+      "seed": "0x00004f5350520001",
+      "orig_dim": 256,
+      "padded_dim": 256,
+      "num_vectors": 16
+    },
+    {
+      "file": "fwht_d512.bin",
+      "total_bytes": 65600,
+      "sha256": "4894daf3b632eeae4370446e30776b0fa5d35368f1d460dec2036620d35c36a8",
+      "sections": [
+        {
+          "name": "sign_words",
+          "offset": 0,
+          "byte_len": 64,
+          "shape": [
+            8
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "inputs",
+          "offset": 64,
+          "byte_len": 32768,
+          "shape": [
+            16,
+            512
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "outputs",
+          "offset": 32832,
+          "byte_len": 32768,
+          "shape": [
+            16,
+            512
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "fwht",
+      "seed": "0x00004f5350520001",
+      "orig_dim": 512,
+      "padded_dim": 512,
+      "num_vectors": 16
+    },
+    {
+      "file": "fwht_d768.bin",
+      "total_bytes": 114816,
+      "sha256": "7bbf68b2ccd0b62c818ab234232ea4d205f04dd39593d486adab7409b2c9cce5",
+      "sections": [
+        {
+          "name": "sign_words",
+          "offset": 0,
+          "byte_len": 128,
+          "shape": [
+            16
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "inputs",
+          "offset": 128,
+          "byte_len": 49152,
+          "shape": [
+            16,
+            768
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "outputs",
+          "offset": 49280,
+          "byte_len": 65536,
+          "shape": [
+            16,
+            1024
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "fwht",
+      "seed": "0x00004f5350520001",
+      "orig_dim": 768,
+      "padded_dim": 1024,
+      "num_vectors": 16
+    },
+    {
+      "file": "fwht_d1024.bin",
+      "total_bytes": 131200,
+      "sha256": "eba713e6cb806f976c58440ebb5409157d2eb87f58ecf08dcd49dea7111ce69f",
+      "sections": [
+        {
+          "name": "sign_words",
+          "offset": 0,
+          "byte_len": 128,
+          "shape": [
+            16
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "inputs",
+          "offset": 128,
+          "byte_len": 65536,
+          "shape": [
+            16,
+            1024
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "outputs",
+          "offset": 65664,
+          "byte_len": 65536,
+          "shape": [
+            16,
+            1024
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "fwht",
+      "seed": "0x00004f5350520001",
+      "orig_dim": 1024,
+      "padded_dim": 1024,
+      "num_vectors": 16
+    },
+    {
+      "file": "fwht_d1536.bin",
+      "total_bytes": 229632,
+      "sha256": "f8acaafeb5381d5aaa6a899bb523cada513cf73d206130463f2cb49c47ce0185",
+      "sections": [
+        {
+          "name": "sign_words",
+          "offset": 0,
+          "byte_len": 256,
+          "shape": [
+            32
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "inputs",
+          "offset": 256,
+          "byte_len": 98304,
+          "shape": [
+            16,
+            1536
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "outputs",
+          "offset": 98560,
+          "byte_len": 131072,
+          "shape": [
+            16,
+            2048
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "fwht",
+      "seed": "0x00004f5350520001",
+      "orig_dim": 1536,
+      "padded_dim": 2048,
+      "num_vectors": 16
+    },
+    {
+      "file": "binary_kmeans_golden.bin",
+      "total_bytes": 268800,
+      "sha256": "cdcfb41fec9b5a25e97ac4a6bd891f8daaf5689a9061e0791c7e613b3186f9cd",
+      "sections": [
+        {
+          "name": "input_vectors",
+          "offset": 0,
+          "byte_len": 262144,
+          "shape": [
+            512,
+            128
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "init_centroids_bits",
+          "offset": 262144,
+          "byte_len": 256,
+          "shape": [
+            16,
+            2
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "assignments",
+          "offset": 262400,
+          "byte_len": 2048,
+          "shape": [
+            512
+          ],
+          "dtype": "<u4"
+        },
+        {
+          "name": "final_centroids_bits",
+          "offset": 264448,
+          "byte_len": 256,
+          "shape": [
+            16,
+            2
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "final_centroids_f16",
+          "offset": 264704,
+          "byte_len": 4096,
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "<f2"
+        }
+      ],
+      "kind": "binary_kmeans",
+      "seed": "0x00004f5350520002",
+      "num_vectors": 512,
+      "dim": 128,
+      "num_clusters": 16
+    },
+    {
+      "file": "rabitq_golden.bin",
+      "total_bytes": 196288,
+      "sha256": "1704a9d3c76091fcd141213debfedb373e87e52148e7759a3794e885315e84ed",
+      "sections": [
+        {
+          "name": "cluster_id",
+          "offset": 0,
+          "byte_len": 2048,
+          "shape": [
+            512
+          ],
+          "dtype": "<u4"
+        },
+        {
+          "name": "res_norm",
+          "offset": 2048,
+          "byte_len": 1024,
+          "shape": [
+            512
+          ],
+          "dtype": "<f2"
+        },
+        {
+          "name": "l1_norm_factor",
+          "offset": 3072,
+          "byte_len": 1024,
+          "shape": [
+            512
+          ],
+          "dtype": "<f2"
+        },
+        {
+          "name": "rabitq_code",
+          "offset": 4096,
+          "byte_len": 8192,
+          "shape": [
+            512,
+            2
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "db_raw_f16",
+          "offset": 12288,
+          "byte_len": 131072,
+          "shape": [
+            512,
+            128
+          ],
+          "dtype": "<f2"
+        },
+        {
+          "name": "centroids_f16",
+          "offset": 143360,
+          "byte_len": 4096,
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "<f2"
+        },
+        {
+          "name": "q_raw_f16",
+          "offset": 147456,
+          "byte_len": 4096,
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "<f2"
+        },
+        {
+          "name": "q_rot",
+          "offset": 151552,
+          "byte_len": 8192,
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "q_scale",
+          "offset": 159744,
+          "byte_len": 64,
+          "shape": [
+            16
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "q_int4",
+          "offset": 159808,
+          "byte_len": 2048,
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "|i1"
+        },
+        {
+          "name": "q_bit_planes",
+          "offset": 161856,
+          "byte_len": 1024,
+          "shape": [
+            16,
+            4,
+            2
+          ],
+          "dtype": "<u8"
+        },
+        {
+          "name": "asym_scores",
+          "offset": 162880,
+          "byte_len": 32768,
+          "shape": [
+            16,
+            512
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "top10_ids_f16",
+          "offset": 195648,
+          "byte_len": 640,
+          "shape": [
+            16,
+            10
+          ],
+          "dtype": "<u4"
+        }
+      ],
+      "kind": "rabitq",
+      "db_seed": "0x00004f5350520002",
+      "query_seed": "0x00004f5350520003",
+      "num_vectors": 512,
+      "dim": 128,
+      "num_clusters": 16,
+      "num_queries": 16
+    },
+    {
+      "file": "lutrank_golden.bin",
+      "total_bytes": 582080,
+      "sha256": "37c54b4d73fd7e5385616f6d23e854de5c6b65e08b37c868c72bc56f2530f48c",
+      "sections": [
+        {
+          "name": "cb_layer1",
+          "offset": 0,
+          "byte_len": 128,
+          "shape": [
+            16,
+            2
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "cb_layer2",
+          "offset": 128,
+          "byte_len": 128,
+          "shape": [
+            16,
+            2
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "doc_tokens_raw",
+          "offset": 256,
+          "byte_len": 262144,
+          "shape": [
+            16,
+            32,
+            128
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "doc_tokens_rot",
+          "offset": 262400,
+          "byte_len": 262144,
+          "shape": [
+            16,
+            32,
+            128
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "doc_nibbles",
+          "offset": 524544,
+          "byte_len": 32768,
+          "shape": [
+            16,
+            32,
+            64
+          ],
+          "dtype": "|u1"
+        },
+        {
+          "name": "q_tokens_raw",
+          "offset": 557312,
+          "byte_len": 4096,
+          "shape": [
+            8,
+            128
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "q_tokens_rot",
+          "offset": 561408,
+          "byte_len": 4096,
+          "shape": [
+            8,
+            128
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "q_lut1_i8",
+          "offset": 565504,
+          "byte_len": 8192,
+          "shape": [
+            8,
+            64,
+            16
+          ],
+          "dtype": "|i1"
+        },
+        {
+          "name": "q_lut2_i8",
+          "offset": 573696,
+          "byte_len": 8192,
+          "shape": [
+            8,
+            64,
+            16
+          ],
+          "dtype": "|i1"
+        },
+        {
+          "name": "scale1",
+          "offset": 581888,
+          "byte_len": 32,
+          "shape": [
+            8
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "scale2",
+          "offset": 581920,
+          "byte_len": 32,
+          "shape": [
+            8
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "maxsim_exact_f32",
+          "offset": 581952,
+          "byte_len": 64,
+          "shape": [
+            16
+          ],
+          "dtype": "<f4"
+        },
+        {
+          "name": "maxsim_lut_f32",
+          "offset": 582016,
+          "byte_len": 64,
+          "shape": [
+            16
+          ],
+          "dtype": "<f4"
+        }
+      ],
+      "kind": "lutrank",
+      "seed": "0x00004f5350520004",
+      "num_docs": 16,
+      "doc_tokens": 32,
+      "query_tokens": 8,
+      "token_dim": 128,
+      "subspace_dim": 2,
+      "num_subspaces": 64,
+      "gamma": 0.28,
+      "sigma": 0.08838834764831843,
+      "pearson_vs_fp32": 0.9998882096701626
+    }
+  ]
+}

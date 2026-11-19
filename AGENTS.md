@@ -1,30 +1,27 @@
 # AGENTS.md — Diretrizes de Engenharia do `ospreydb`
 
-Este repositório contém o servidor de banco vetorial e camada comercial (**`ospreydb/ospreydb`**), consumindo `osprey-core`, `osprey-simd` e `osprey-storage` de `ospreydb/osprey-engine` exclusivamente via dependências externas no [`Cargo.toml`](./Cargo.toml).
+Este repositório contém o projeto unificado **OspreyDB (`ospreydb/ospreydb`)**, **100% Open Source sob a licença Apache-2.0**, estruturado como um workspace Cargo de 5 crates (`osprey-core`, `osprey-simd`, `osprey-storage`, `osprey-cli`, `ospreydb`).
 
 ---
 
-## 1. Fronteira Estrita Open-Core vs. Pro
-- Nunca adicione código comercial (`WAL`, `LsmDeltaBuffer`, `CowSlabCompactor`, `manifest.json` CAS, servidores HTTP/Arrow Flight ou chaves/verificadores `Ed25519`) no repositório aberto `ospreydb/osprey-engine`.
-- Nunca adicione caminhos locais de máquina (ex.: `/home/...`) no [`Cargo.toml`](./Cargo.toml); mantenha dependências remotas reproduzíveis e travadas no [`Cargo.lock`](./Cargo.lock).
+## 1. Topologia do Workspace (Apache-2.0)
+- `crates/osprey-core`: formatos binários alinhados a 64 bytes (`.osi`, `.osv`, `.osr`), FWHT, `1-Bit Binary K-Means`, `RaBitQ`, `LUT-Rank`, `RangePlanner` e traits de extensão (`DeltaBufferExt` / `StorageEngineExt`). Sem I/O de rede ou sistema de arquivos.
+- `crates/osprey-simd`: kernels SIMD com despacho em runtime (`AVX-512 VPOPCNTDQ`/`BW`, `AVX2`, `ARM64 NEON`, fallback escalar). Zero alocações de heap nos hot loops.
+- `crates/osprey-storage`: leitores `memmap2`, empacotamento TSP, codec Zstd, `RoaringBitmap` tombstones, cliente `object_store` (S3/GCS/Azure/HTTP/local) e `RangePlanner` DP.
+- `crates/osprey-cli`: biblioteca e CLI de engine (`import`, `search`, `rerank`, `delete`, `inspect`, `bench`, `doctor`, `completions`).
+- `crates/ospreydb`: binário unificado `osprey` integrando daemon (`serve` HTTP `:6333`, Arrow Flight `:8815`, WAL, `LsmDeltaBuffer`, `CowSlabCompactor`, `TombstoneGarbageCollector`, `manifest.json` CAS) e todos os subcomandos CLI.
+- Nunca adicione caminhos locais de máquina (ex.: `/home/...`) no [`Cargo.toml`](./Cargo.toml); mantenha dependências reproduzíveis e travadas no [`Cargo.lock`](./Cargo.lock).
 
-## 2. Regras de Licenciamento Offline (`Ed25519`)
-- **Zero Phone-Home:** Toda verificação de licença é 100% offline sobre a chave pública embutida (`crates/ospreydb/src/osprey_pro_ed25519.pub`). Nunca versione chaves privadas (`*.pem`, `*.key`, `*.sk`) nem arquivos `.env`.
-- **Modelo de Assinatura Anual + Grace Period de 30 dias:**
-  - Não existe licença perpétua (`perpetual_fallback`).
-  - Se `now > expires_at` e `now <= expires_at + 30 dias`, o daemon deve iniciar emitindo `tracing::warn!` claro indicando o período de tolerância.
-  - Se `now > expires_at + 30 dias`, a verificação falha com `ProLicenseError::LicenseExpired` bloqueando o modo Pro.
-- **Plano Free (`Community Tier`, 5M vetores):**
-  - Ao atingir 5.000.000 de vetores, o daemon **não pode parar ou recusar leituras**: buscas HTTP, reranking, `/metrics`, `/healthz` e Arrow Flight `DoExchange`/`DoGet` permanecem ativos; apenas novas inserções (`PUT /collections/{name}/points` e Arrow Flight `DoPut`) são bloqueadas.
-
-## 3. Invariantes de Código e Portões de Qualidade
+## 2. Invariantes de Código e Portões de Qualidade
 - **Zero `unwrap()` / `expect()` em Produção:** Estritamente proibido fora de `#[cfg(test)]` (imposto pelos workspace lints no [`Cargo.toml`](./Cargo.toml)).
+- **Alinhamento de 64 bytes:** Headers (`.osi`, `.osv`, `.osr`) são `#[repr(C, align(64))]` com `bytemuck::Pod`/`Zeroable` sem padding implícito e seções tabulares em múltiplos de 64 bytes.
 - **Toolchain & Formatação:** Respeite [`rust-toolchain.toml`](./rust-toolchain.toml), [`rustfmt.toml`](./rustfmt.toml) e [`.editorconfig`](./.editorconfig).
 - **Portões obrigatórios antes de commit:**
   - `cargo fmt --all -- --check`
   - `cargo check --workspace --all-targets --locked`
   - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
   - `cargo test --workspace --release --locked`
+  - `cargo check --manifest-path fuzz/Cargo.toml`
+  - `python3 reference/poc_reference.py`
 - **Higiene de Git e CI:**
-  - Nunca versione `target/`, `infra/ci/.env`, dumps de memória, `*.parquet`, `*.bin`, `*.osi`, `*.osv`, `*.osr`, `*.pem` ou `*.key`.
-  - O workflow [`.github/workflows/release.yml`](./.github/workflows/release.yml) roda exclusivamente no runner self-hosted Linux (`[self-hosted, osprey-pro-builder]`) para PRs em `main` e tags `v*` / `pro-v*`.
+  - Nunca versione `target/`, `infra/ci/.env`, dumps de memória, `*.parquet`, `*.bin` (exceto `reference/golden/**`), `*.osi`, `*.osv`, `*.osr`, `*.pem` ou `*.key`.

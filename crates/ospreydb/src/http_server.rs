@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
@@ -20,10 +21,6 @@ use tokio::net::TcpListener;
 use crate::delta_buffer::HybridSearchEngine;
 use crate::embedder::Embedder;
 use crate::error::{ProEngineError, ProResult};
-use crate::license::{
-    current_unix_secs, OfflineLicenseVerifier, OspreyLicense, VectorQuotaState,
-    COMMUNITY_MAX_VECTORS,
-};
 use crate::metrics::ProMetricsRegistry;
 use crate::rerank_service::LutRankReranker;
 
@@ -39,7 +36,7 @@ pub struct HttpServerState {
     embedder: Arc<Embedder>,
     metrics: Arc<ProMetricsRegistry>,
     default_nprobe: usize,
-    quota: VectorQuotaState,
+    total_vectors: Arc<AtomicU64>,
     api_key: Option<String>,
     read_only: bool,
 }
@@ -51,15 +48,15 @@ impl HttpServerState {
         embedder: Arc<Embedder>,
         metrics: Arc<ProMetricsRegistry>,
     ) -> Self {
-        Self::with_quota(reranker, embedder, metrics, VectorQuotaState::new())
+        Self::with_vector_counter(reranker, embedder, metrics, Arc::new(AtomicU64::new(0)))
     }
 
     #[must_use]
-    pub fn with_quota(
+    pub fn with_vector_counter(
         reranker: Arc<LutRankReranker>,
         embedder: Arc<Embedder>,
         metrics: Arc<ProMetricsRegistry>,
-        quota: VectorQuotaState,
+        total_vectors: Arc<AtomicU64>,
     ) -> Self {
         Self {
             collections: Arc::new(RwLock::new(HashMap::new())),
@@ -67,7 +64,7 @@ impl HttpServerState {
             embedder,
             metrics,
             default_nprobe: 16,
-            quota,
+            total_vectors,
             api_key: None,
             read_only: false,
         }
@@ -108,25 +105,15 @@ impl HttpServerState {
         Ok(guard.get(name).cloned())
     }
 
-    /// Activates a Pro license, unlocking unlimited vectors and multi-node features.
-    pub fn activate_license(&self, license: OspreyLicense) {
-        self.quota.activate_license(license);
-    }
-
-    /// Returns the current vector count across all collections.
+    /// Returns the tracked total vector count across all collections.
     #[must_use]
     pub fn total_vector_count(&self) -> u64 {
-        self.quota.total_vector_count()
+        self.total_vectors.load(Ordering::Acquire)
     }
 
-    /// Checks whether the total vector count is allowed under the active license.
-    /// Returns `Ok(())` if allowed, or `ProEngineError::CommunityTierLimitReached` if blocked.
-    pub fn check_vector_limit(&self, additional: u64) -> Result<(), ProEngineError> {
-        self.quota.check_vector_limit(additional)
-    }
-
+    /// Increments the tracked total vector count by `delta` after successful ingestion.
     pub fn increment_vector_count(&self, delta: u64) {
-        self.quota.increment_vector_count(delta);
+        self.total_vectors.fetch_add(delta, Ordering::Release);
     }
 }
 
@@ -137,7 +124,6 @@ pub fn build_http_router(state: HttpServerState) -> Router {
         .route("/metrics", get(handle_metrics))
         .route("/v1/rerank", post(handle_cohere_rerank))
         .route("/v1/embeddings", post(handle_embeddings))
-        .route("/v1/license/activate", post(handle_license_activate))
         .route("/collections", get(handle_qdrant_list_collections))
         .route(
             "/collections/{name}",
@@ -618,25 +604,6 @@ async fn handle_qdrant_upsert(
 
     let embedding_count = u64::try_from(texts_to_embed.len()).unwrap_or(0);
 
-    // Enforce community tier vector limit
-    if let Err(limit_err) = state.check_vector_limit(u64::try_from(req.points.len()).unwrap_or(0)) {
-        let status_code = if matches!(limit_err, ProEngineError::CommunityTierLimitReached { .. }) {
-            StatusCode::from_u16(402).unwrap_or(StatusCode::PAYMENT_REQUIRED)
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return (
-            status_code,
-            Json(json!({
-                "status": {
-                    "error": format!("{limit_err}"),
-                    "current_count": state.total_vector_count(),
-                }
-            })),
-        )
-            .into_response();
-    }
-
     let embedded: Vec<Vec<f32>> = if !texts_to_embed.is_empty() {
         match state.embedder.embed_batch(&texts_to_embed).await {
             Ok(emb) => emb,
@@ -941,34 +908,6 @@ async fn handle_qdrant_collection_info(
     let delta_live = engine.delta_buffer().live_count().unwrap_or(0);
     let segments = engine.loaded_segment_count().unwrap_or(0);
     let total_vecs = state.total_vector_count();
-    let limit_reached = state.quota.is_limit_reached();
-    let now_secs = current_unix_secs().unwrap_or(0);
-    let license_info = state
-        .quota
-        .active_license_snapshot()
-        .map(|lic| {
-            let in_grace_period = lic.is_in_grace_period_at(now_secs);
-            json!({
-                "tier": lic.tier,
-                "max_vectors": lic.max_vectors,
-                "is_unlimited": lic.is_unlimited_vectors(),
-                "limit_reached": limit_reached,
-                "read_only": limit_reached,
-                "in_grace_period": in_grace_period,
-                "grace_days_remaining": lic.grace_days_remaining_at(now_secs),
-            })
-        })
-        .unwrap_or_else(|| {
-            json!({
-                "tier": "community",
-                "max_vectors": COMMUNITY_MAX_VECTORS,
-                "is_unlimited": false,
-                "limit_reached": limit_reached,
-                "read_only": limit_reached,
-                "in_grace_period": false,
-                "grace_days_remaining": 0,
-            })
-        });
 
     (
         StatusCode::OK,
@@ -978,7 +917,7 @@ async fn handle_qdrant_collection_info(
                 "segments_count": segments,
                 "delta_vectors_count": delta_live,
                 "total_vectors_count": total_vecs,
-                "license": license_info,
+                "read_only": state.read_only,
                 "embedder": {
                     "configured": state.embedder.is_configured(),
                     "model": state.embedder.model(),
@@ -1086,68 +1025,4 @@ async fn handle_embeddings(
         )
             .into_response(),
     }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct LicenseActivateRequest {
-    license: String,
-}
-
-async fn handle_license_activate(
-    State(state): State<HttpServerState>,
-    Json(req): Json<LicenseActivateRequest>,
-) -> Response {
-    let verifier = match OfflineLicenseVerifier::new() {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "status": { "error": err.to_string() } })),
-            )
-                .into_response();
-        }
-    };
-
-    let lic = match verifier.verify_now(req.license.trim()) {
-        Ok(l) => l,
-        Err(err) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "status": { "error": err.to_string() } })),
-            )
-                .into_response();
-        }
-    };
-
-    let now_secs = current_unix_secs().unwrap_or(0);
-    let in_grace = lic.is_in_grace_period_at(now_secs);
-    let grace_days = lic.grace_days_remaining_at(now_secs);
-    if in_grace {
-        tracing::warn!(
-            org = %lic.customer_org,
-            tier = %lic.tier,
-            expires_at = lic.expires_at,
-            grace_days_remaining = grace_days,
-            "activated expired license inside 30-day renewal grace period; renew before grace deadline to avoid Pro startup block"
-        );
-    }
-
-    state.activate_license(lic.clone());
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "ok",
-            "result": {
-                "customer_org": lic.customer_org,
-                "tier": lic.tier,
-                "max_nodes": lic.max_nodes,
-                "max_vectors": lic.max_vectors,
-                "is_unlimited": lic.is_unlimited_vectors(),
-                "expires_at": lic.expires_at,
-                "in_grace_period": in_grace,
-                "grace_days_remaining": grace_days,
-            }
-        })),
-    )
-        .into_response()
 }

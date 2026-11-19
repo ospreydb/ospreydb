@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -30,8 +31,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::delta_buffer::HybridSearchEngine;
-use crate::error::{ProEngineError, ProResult};
-use crate::license::VectorQuotaState;
+use crate::error::ProResult;
 use crate::rerank_service::LutRankReranker;
 
 /// Default Apache Arrow Flight gRPC bind address (`grpc://0.0.0.0:8815`).
@@ -44,7 +44,7 @@ type TonicStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Se
 pub struct OspreyFlightService {
     engine: Arc<HybridSearchEngine>,
     reranker: Arc<LutRankReranker>,
-    quota: VectorQuotaState,
+    total_vectors: Arc<AtomicU64>,
     default_nprobe: usize,
     default_top_k: usize,
     read_only: bool,
@@ -54,20 +54,20 @@ impl OspreyFlightService {
     /// Creates a new [`OspreyFlightService`].
     #[must_use]
     pub fn new(engine: Arc<HybridSearchEngine>, reranker: Arc<LutRankReranker>) -> Self {
-        Self::with_quota(engine, reranker, VectorQuotaState::new())
+        Self::with_vector_counter(engine, reranker, Arc::new(AtomicU64::new(0)))
     }
 
-    /// Creates a new [`OspreyFlightService`] sharing a [`VectorQuotaState`] with HTTP endpoints.
+    /// Creates a new [`OspreyFlightService`] sharing a vector counter with HTTP endpoints.
     #[must_use]
-    pub fn with_quota(
+    pub fn with_vector_counter(
         engine: Arc<HybridSearchEngine>,
         reranker: Arc<LutRankReranker>,
-        quota: VectorQuotaState,
+        total_vectors: Arc<AtomicU64>,
     ) -> Self {
         Self {
             engine,
             reranker,
-            quota,
+            total_vectors,
             default_nprobe: 16,
             default_top_k: 10,
             read_only: false,
@@ -571,14 +571,6 @@ impl FlightService for OspreyFlightService {
             }
 
             let batch_len = u64::try_from(raw_records.len()).unwrap_or(0);
-            if let Err(limit_err) = self.quota.check_vector_limit(batch_len) {
-                return Err(match limit_err {
-                    ProEngineError::CommunityTierLimitReached { .. } => {
-                        Status::resource_exhausted(limit_err.to_string())
-                    }
-                    other => Status::internal(other.to_string()),
-                });
-            }
 
             last_seq = self
                 .engine
@@ -586,7 +578,7 @@ impl FlightService for OspreyFlightService {
                 .ingest_batch(&raw_records)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             self.engine.metrics().observe_wal_ingest(raw_records.len());
-            self.quota.increment_vector_count(batch_len);
+            self.total_vectors.fetch_add(batch_len, Ordering::Release);
             total_ingested = total_ingested.saturating_add(raw_records.len());
         }
 

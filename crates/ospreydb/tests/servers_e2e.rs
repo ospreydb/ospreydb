@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -26,8 +27,8 @@ use osprey_storage::{
 use ospreydb::{
     build_http_router, ClusterManifest, CompactorConfig, CowSlabCompactor, Embedder,
     EmbedderConfig, HttpServerState, HybridSearchEngine, LsmDeltaBuffer, LutRankReranker,
-    ManifestStore, OspreyFlightService, ProMetricsRegistry, VectorQuotaState,
-    COMMUNITY_MAX_VECTORS, DEFAULT_LUTRANK_SEED, DEFAULT_MANIFEST_KEY,
+    ManifestStore, OspreyFlightService, ProMetricsRegistry, DEFAULT_LUTRANK_SEED,
+    DEFAULT_MANIFEST_KEY,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -462,7 +463,7 @@ async fn dropin_cohere_rerank_qdrant_search_and_prometheus_metrics_e2e() {
 }
 
 #[tokio::test]
-async fn arrow_flight_blocks_do_put_at_community_limit_while_reads_keep_working() {
+async fn arrow_flight_allows_unlimited_do_put_above_5m_vectors_without_paywall() {
     let dim = 64_usize;
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let manifest_store = ManifestStore::new(Arc::clone(&store), DEFAULT_MANIFEST_KEY);
@@ -490,8 +491,12 @@ async fn arrow_flight_blocks_do_put_at_community_limit_while_reads_keep_working(
         RangePlannerConfig::default(),
     ));
     let reranker = Arc::new(LutRankReranker::new(DEFAULT_LUTRANK_SEED).unwrap());
-    let quota = VectorQuotaState::with_initial_vectors(COMMUNITY_MAX_VECTORS);
-    let svc = OspreyFlightService::with_quota(Arc::clone(&engine), reranker, quota);
+    let counter = Arc::new(AtomicU64::new(5_000_000));
+    let svc = OspreyFlightService::with_vector_counter(
+        Arc::clone(&engine),
+        reranker,
+        Arc::clone(&counter),
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -511,7 +516,7 @@ async fn arrow_flight_blocks_do_put_at_community_limit_while_reads_keep_working(
     let endpoint = format!("http://{addr}");
     let mut client = FlightServiceClient::connect(endpoint).await.unwrap();
 
-    // 1. DoPut must reject new vectors when Community Tier 5M limit is reached
+    // 1. DoPut must succeed freely above 5M vectors (100% Apache-2.0, zero paywall)
     let put_schema = Arc::new(Schema::new(vec![
         Field::new("doc_id", DataType::UInt64, false),
         Field::new(
@@ -540,14 +545,22 @@ async fn arrow_flight_blocks_do_put_at_community_limit_while_reads_keep_working(
         .await
         .unwrap();
 
-    let put_err = client
+    let put_res: Vec<_> = client
         .do_put(stream::iter(flight_data))
         .await
-        .expect_err("DoPut should reject inserts at 5M community limit");
-    assert_eq!(put_err.code(), tonic::Code::ResourceExhausted);
-    assert!(put_err.message().contains("Community Tier limit"));
+        .expect("DoPut must succeed without vector cap")
+        .into_inner()
+        .try_collect()
+        .await
+        .unwrap();
+    let meta: Value = serde_json::from_slice(&put_res[0].app_metadata).unwrap();
+    assert_eq!(meta["ingested"], 1);
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Acquire),
+        5_000_001
+    );
 
-    // 2. DoExchange vector search must STILL work normally on the same node
+    // 2. DoExchange vector search works normally
     let search_schema = Arc::new(Schema::new(vec![
         Field::new("query_id", DataType::UInt64, false),
         Field::new(
@@ -598,7 +611,7 @@ async fn arrow_flight_blocks_do_put_at_community_limit_while_reads_keep_working(
         .unwrap();
     assert_eq!(top_docs.value(0), 777);
 
-    // 3. ListFlights & DoGet metadata must STILL work normally
+    // 3. ListFlights & DoGet metadata work normally
     let flights: Vec<_> = client
         .list_flights(Criteria::default())
         .await

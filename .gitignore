@@ -32,8 +32,10 @@ heaptrack.*
 *.osv
 *.osr
 *.bin
+!reference/golden/
+!reference/golden/**
 
-# Cryptographic keys, certificates & secrets (CRITICAL: never commit Ed25519 private keys)
+# Cryptographic keys, certificates & secrets
 *.pem
 *.key
 *.sk
@@ -62,3 +64,7 @@ Thumbs.db
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]

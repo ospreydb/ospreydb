@@ -80,11 +80,11 @@ print_github_instructions() {
   cat <<'EOF'
 
 === GitHub Registration Instructions ===
-1. Open the private repository on GitHub:
+1. Open the repository on GitHub:
    Settings -> Actions -> Runners -> New self-hosted runner
 2. Copy the short-lived token into `infra/ci/.env` as `RUNNER_TOKEN=...`
    (OR set a PAT with `repo` scope as `ACCESS_TOKEN=...` for auto-renewal on restarts).
-3. Verify the runner appears online with label `osprey-pro-builder` under:
+3. Verify the runner appears online with label `osprey-builder` under:
    Settings -> Actions -> Runners
 EOF
 }
