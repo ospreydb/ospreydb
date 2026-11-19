@@ -36,7 +36,7 @@ use osprey_storage::{
 use roaring::RoaringBitmap;
 use serde::Serialize;
 
-use crate::cli::ImportArgs;
+use crate::cli::{ImportArgs, OsvCompressionMode};
 use crate::commands::delete::atomic_write_file;
 use crate::output::{
     format_bytes, paint_accent, paint_pass, print_json, print_kv, print_section,
@@ -130,10 +130,23 @@ pub fn run(args: &ImportArgs, ctx: &CliContext) -> CliResult<()> {
         expected_colbert_dim: want_lutrank.then_some(LUTRANK_TOKEN_DIM),
     };
 
-    let osv_config = OsvWriterConfig {
-        minipage_target_bytes: args.page_size_kb * 1024,
-        enable_zstd_dict: !args.no_zstd_dict,
-        ..Default::default()
+    let use_zstd = match args.osv_compression {
+        OsvCompressionMode::Auto => matches!(output_target, LocationTarget::Remote(_)),
+        OsvCompressionMode::None => false,
+        OsvCompressionMode::Zstd => true,
+    };
+
+    let osv_config = if use_zstd {
+        OsvWriterConfig {
+            minipage_target_bytes: args.page_size_kb * 1024,
+            enable_zstd_dict: !args.no_zstd_dict,
+            ..Default::default()
+        }
+    } else {
+        OsvWriterConfig {
+            minipage_target_bytes: args.page_size_kb * 1024,
+            ..OsvWriterConfig::uncompressed()
+        }
     };
 
     let pipeline = OutOfCoreIngestPipeline::new(OutOfCoreIngestConfig {
@@ -1422,6 +1435,7 @@ mod tests {
             batch_size: 16,
             sample_size: 32,
             no_zstd_dict: false,
+            osv_compression: crate::cli::OsvCompressionMode::Auto,
             seed: 0x1234,
         };
         let ctx = CliContext {
@@ -1471,6 +1485,7 @@ mod tests {
             batch_size: 8,
             sample_size: 16,
             no_zstd_dict: true,
+            osv_compression: crate::cli::OsvCompressionMode::Auto,
             seed: 99,
         };
         run(&args_jsonl, &ctx).unwrap();

@@ -42,7 +42,7 @@ pub use range_planner::{
     PageByteInterval, RangePlannerConfig, DEFAULT_COALESCE_MAX_K, DEFAULT_COALESCE_TAU_BYTE,
     DEFAULT_COALESCE_TAU_REQ, DEFAULT_MAX_COALESCE_BYTES,
 };
-pub use refine::{RefineStage, RefineStats, RefinedSearchResult};
+pub use refine::{LocalOsvBacking, RefineStage, RefineStats, RefinedSearchResult};
 pub use remote_store::{
     build_client_options, build_object_store, fetch_coalesced_ranges_resilient,
     fetch_coalesced_ranges_with_transport, slice_and_decompress_coalesced, AsyncRangeTransport,

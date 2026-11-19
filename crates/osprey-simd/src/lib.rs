@@ -11,5 +11,14 @@ pub mod detect;
 pub mod neon;
 
 pub use backend::{ScalarBackend, SimdBackend, SimdEngine};
-pub use detect::{active_simd_backend, detect_best_simd_level, is_level_supported, SimdLevel};
+pub use detect::{
+    active_simd_backend, detect_best_simd_level, is_f16c_supported, is_level_supported, SimdLevel,
+};
 pub use osprey_core::{OspreyError, OspreyResult};
+
+/// Computes the exact `f32 x f16` inner product accumulated in `f32` using the
+/// best runtime-detected SIMD backend (`AVX-512F+F16C+FMA`, `AVX2+F16C+FMA`, or scalar).
+#[inline]
+pub fn dot_f32_f16(a_f32: &[f32], b_f16: &[half::f16]) -> f32 {
+    SimdEngine::new_auto().dot_f32_f16(a_f32, b_f16)
+}

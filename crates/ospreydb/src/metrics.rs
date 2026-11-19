@@ -86,7 +86,7 @@ impl LatencyHistogram {
         self.sum_us.fetch_add(latency_us, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
 
-        if let Ok(mut guard) = self.ring.lock() {
+        if let Ok(mut guard) = self.ring.try_lock() {
             guard.push(latency_us);
         }
     }
@@ -162,12 +162,76 @@ pub struct MetricsSnapshot {
     pub lutrank_p50_p95_p99_us: (f64, f64, f64),
 }
 
+/// Lock-free atomic histogram + sum/count/max tracker for per-stage breakdown telemetry.
+#[derive(Debug)]
+struct AtomicStageHistogram {
+    buckets: [AtomicU64; 13],
+    overflow: AtomicU64,
+    sum_us: AtomicU64,
+    count: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl AtomicStageHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            overflow: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn observe(&self, latency_us: u64) {
+        let mut matched = false;
+        for (idx, &bound) in LATENCY_BUCKETS_US.iter().enumerate() {
+            if latency_us <= bound {
+                self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.max_us.fetch_max(latency_us, Ordering::Relaxed);
+    }
+
+    fn write_prometheus(&self, out: &mut String, metric_base: &str, help: &str) {
+        let _ = writeln!(out, "# HELP {metric_base} {help}");
+        let _ = writeln!(out, "# TYPE {metric_base} histogram");
+        let mut cumulative = 0_u64;
+        for (idx, &bound) in LATENCY_BUCKETS_US.iter().enumerate() {
+            cumulative = cumulative.saturating_add(self.buckets[idx].load(Ordering::Relaxed));
+            let _ = writeln!(out, "{metric_base}_bucket{{le=\"{bound}\"}} {cumulative}");
+        }
+        let total = cumulative.saturating_add(self.overflow.load(Ordering::Relaxed));
+        let _ = writeln!(out, "{metric_base}_bucket{{le=\"+Inf\"}} {total}");
+        let sum = self.sum_us.load(Ordering::Relaxed);
+        let count = self.count.load(Ordering::Relaxed);
+        let max = self.max_us.load(Ordering::Relaxed);
+        let _ = writeln!(out, "{metric_base}_sum {sum}");
+        let _ = writeln!(out, "{metric_base}_count {count}");
+        let _ = writeln!(out, "# TYPE {metric_base}_max_microseconds gauge");
+        let _ = writeln!(out, "{metric_base}_max_microseconds {max}");
+    }
+}
+
 /// Lock-free Prometheus metrics collector for `osprey` servers and query pipelines.
 #[derive(Debug)]
 pub struct ProMetricsRegistry {
     rabitq_scan_us: LatencyHistogram,
     range_planner_us: LatencyHistogram,
     lutrank_us: LatencyHistogram,
+    stage1_us: AtomicStageHistogram,
+    cache_lookup_us: AtomicStageHistogram,
+    disk_read_us: AtomicStageHistogram,
+    zstd_decode_us: AtomicStageHistogram,
+    f16_score_us: AtomicStageHistogram,
     s3_raw_page_requests: AtomicU64,
     s3_coalesced_range_gets: AtomicU64,
     s3_cache_hits: AtomicU64,
@@ -195,6 +259,11 @@ impl ProMetricsRegistry {
             rabitq_scan_us: LatencyHistogram::new(),
             range_planner_us: LatencyHistogram::new(),
             lutrank_us: LatencyHistogram::new(),
+            stage1_us: AtomicStageHistogram::new(),
+            cache_lookup_us: AtomicStageHistogram::new(),
+            disk_read_us: AtomicStageHistogram::new(),
+            zstd_decode_us: AtomicStageHistogram::new(),
+            f16_score_us: AtomicStageHistogram::new(),
             s3_raw_page_requests: AtomicU64::new(0),
             s3_coalesced_range_gets: AtomicU64::new(0),
             s3_cache_hits: AtomicU64::new(0),
@@ -212,6 +281,21 @@ impl ProMetricsRegistry {
     /// Records a Stage-1 RaBitQ scan latency sample in microseconds.
     pub fn observe_rabitq_scan(&self, latency_us: u64) {
         self.rabitq_scan_us.observe(latency_us);
+        self.stage1_us.observe(latency_us);
+    }
+
+    /// Records Stage-2/Stage-3 breakdown timings in microseconds (lock-free).
+    pub fn observe_refine_breakdown(
+        &self,
+        cache_lookup_us: u64,
+        disk_read_us: u64,
+        zstd_decode_us: u64,
+        f16_score_us: u64,
+    ) {
+        self.cache_lookup_us.observe(cache_lookup_us);
+        self.disk_read_us.observe(disk_read_us);
+        self.zstd_decode_us.observe(zstd_decode_us);
+        self.f16_score_us.observe(f16_score_us);
     }
 
     /// Records Stage-2 DP range planning latency and S3 request savings.
@@ -315,6 +399,31 @@ impl ProMetricsRegistry {
             &mut out,
             "osprey_pro_lutrank_duration_microseconds",
             "Stage-4 LUT-Rank MaxSim reranking latency in microseconds",
+        );
+        self.stage1_us.write_prometheus(
+            &mut out,
+            "osprey_pro_stage1_duration_microseconds",
+            "Stage-1 RaBitQ scan latency in microseconds",
+        );
+        self.cache_lookup_us.write_prometheus(
+            &mut out,
+            "osprey_pro_cache_lookup_duration_microseconds",
+            "Stage-2 minipage LRU cache lookup latency in microseconds",
+        );
+        self.disk_read_us.write_prometheus(
+            &mut out,
+            "osprey_pro_disk_read_duration_microseconds",
+            "Stage-2 object-store or local pread latency in microseconds",
+        );
+        self.zstd_decode_us.write_prometheus(
+            &mut out,
+            "osprey_pro_zstd_decode_duration_microseconds",
+            "Stage-2 Zstd decompression and checksum verification latency in microseconds",
+        );
+        self.f16_score_us.write_prometheus(
+            &mut out,
+            "osprey_pro_f16_score_duration_microseconds",
+            "Stage-3 exact f16 scoring and top-K selection latency in microseconds",
         );
 
         let snap = self.snapshot();
@@ -462,6 +571,7 @@ mod tests {
         }
         reg.observe_range_plan_and_s3(180, 16, 3, 5);
         reg.observe_lutrank(32, 4096, 500);
+        reg.observe_refine_breakdown(15, 35, 10, 45);
 
         let text = reg.render_prometheus();
         assert!(text.contains("osprey_pro_rabitq_scan_duration_microseconds_bucket{le=\"50\"}"));
@@ -472,5 +582,10 @@ mod tests {
         assert!(text.contains("osprey_pro_s3_calls_saved_total 13"));
         assert!(text.contains("osprey_pro_lutrank_tokens_total 4096"));
         assert!(text.contains("osprey_pro_lutrank_tokens_per_sec"));
+        assert!(text.contains("osprey_pro_stage1_duration_microseconds_count 6"));
+        assert!(text.contains("osprey_pro_cache_lookup_duration_microseconds_count 1"));
+        assert!(text.contains("osprey_pro_disk_read_duration_microseconds_count 1"));
+        assert!(text.contains("osprey_pro_zstd_decode_duration_microseconds_count 1"));
+        assert!(text.contains("osprey_pro_f16_score_duration_microseconds_count 1"));
     }
 }

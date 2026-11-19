@@ -1,8 +1,9 @@
 //! Safe SIMD backend trait, portable `ScalarBackend`, and runtime `SimdEngine` dispatcher.
 
-use osprey_core::{OspreyError, OspreyResult};
+use half::f16;
+use osprey_core::{dot_f32_f16_scalar, OspreyError, OspreyResult};
 
-use crate::detect::{detect_best_simd_level, is_level_supported, SimdLevel};
+use crate::detect::{detect_best_simd_level, is_f16c_supported, is_level_supported, SimdLevel};
 
 /// Unified safe contract for hardware-accelerated and scalar kernels across Phases 4–7.
 ///
@@ -94,6 +95,12 @@ pub trait SimdBackend: Send + Sync + 'static {
         }
         total
     }
+
+    /// Computes the exact `f32 x f16` inner product accumulated in `f32`.
+    #[inline]
+    fn dot_f32_f16(&self, a_f32: &[f32], b_f16: &[f16]) -> f32 {
+        dot_f32_f16_scalar(a_f32, b_f16)
+    }
 }
 
 impl osprey_core::cluster::BinaryKMeansKernel for SimdEngine {
@@ -176,6 +183,11 @@ impl osprey_core::rabitq::RabitqScanKernel for ScalarBackend {
     ) -> i32 {
         SimdBackend::rabitq_4bit_dot_u64(self, query_planes, query_signs, query_abs_sum, db_bits)
     }
+
+    #[inline]
+    fn dot_f32_f16(&self, a_f32: &[f32], b_f16: &[f16]) -> f32 {
+        SimdBackend::dot_f32_f16(self, a_f32, b_f16)
+    }
 }
 
 impl osprey_core::rabitq::RabitqFwhtKernel for SimdEngine {
@@ -200,6 +212,11 @@ impl osprey_core::rabitq::RabitqScanKernel for SimdEngine {
         db_bits: &[u64],
     ) -> i32 {
         SimdBackend::rabitq_4bit_dot_u64(self, query_planes, query_signs, query_abs_sum, db_bits)
+    }
+
+    #[inline]
+    fn dot_f32_f16(&self, a_f32: &[f32], b_f16: &[f16]) -> f32 {
+        SimdBackend::dot_f32_f16(self, a_f32, b_f16)
     }
 }
 
@@ -896,6 +913,30 @@ impl SimdBackend for SimdEngine {
             ),
         }
     }
+
+    #[inline]
+    fn dot_f32_f16(&self, a_f32: &[f32], b_f16: &[f16]) -> f32 {
+        let _n = a_f32.len().min(b_f16.len());
+        match self.level {
+            #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+            SimdLevel::Avx512
+                if _n >= 16 && is_level_supported(SimdLevel::Avx512) && is_f16c_supported() =>
+            {
+                // SAFETY: `is_level_supported(Avx512)` and `is_f16c_supported()` confirmed
+                // `avx512f`, `f16c`, and `fma` support on host.
+                unsafe { crate::avx512::dot_f32_f16_avx512(a_f32, b_f16) }
+            }
+            #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+            SimdLevel::Avx2 | SimdLevel::Avx512
+                if _n >= 8 && is_level_supported(SimdLevel::Avx2) && is_f16c_supported() =>
+            {
+                // SAFETY: `is_level_supported(Avx2)` and `is_f16c_supported()` confirmed
+                // `avx2`, `f16c`, and `fma` support on host.
+                unsafe { crate::avx2::dot_f32_f16_avx2(a_f32, b_f16) }
+            }
+            _ => dot_f32_f16_scalar(a_f32, b_f16),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1425,6 +1466,40 @@ mod tests {
                 "saturation failed on doc_maxsim level={:?}: got={doc_sat}",
                 engine.active_level()
             );
+        }
+    }
+
+    #[test]
+    fn dot_f32_f16_all_backends_match_scalar_across_dims() {
+        use osprey_core::math::SplitMix64;
+
+        let backends = supported_backends();
+        let scalar = SimdEngine::with_level(SimdLevel::Scalar);
+        let mut rng = SplitMix64::new(0xF16C_D070);
+
+        for dim in [1usize, 7, 8, 15, 16, 31, 63, 64, 128, 384, 768, 1536] {
+            let mut a = Vec::with_capacity(dim);
+            let mut b = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                let r1 = ((rng.next_u64() >> 11) as f64) / ((1_u64 << 53) as f64) * 2.0 - 1.0;
+                let r2 = ((rng.next_u64() >> 11) as f64) / ((1_u64 << 53) as f64) * 2.0 - 1.0;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    a.push(r1 as f32);
+                    b.push(f16::from_f32(r2 as f32));
+                }
+            }
+            let expected = scalar.dot_f32_f16(&a, &b);
+            for engine in &backends {
+                let got = engine.dot_f32_f16(&a, &b);
+                assert!(
+                    (got - expected).abs() < 1e-3,
+                    "dot_f32_f16 mismatch dim={dim} level={:?}: got={got} expected={expected}",
+                    engine.active_level()
+                );
+            }
+            let auto_got = crate::dot_f32_f16(&a, &b);
+            assert!((auto_got - expected).abs() < 1e-3);
         }
     }
 }

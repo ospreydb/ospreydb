@@ -5,10 +5,14 @@
 //! computation, 1-bit Little-Endian bit-packing, and parallel `OsiIndex` construction
 //! with validated zero-copy `.osi` serialization/deserialization.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::fs::File;
 use std::mem::size_of;
+use std::path::Path;
 
 use half::f16;
+use memmap2::Mmap;
 #[cfg(not(miri))]
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -18,9 +22,9 @@ use crate::aligned::{ensure_aligned_64, AlignedBuffer, CACHE_LINE_ALIGN};
 use crate::cluster::BinaryKMeansResult;
 use crate::error::{OspreyError, OspreyResult};
 use crate::format::osi::{
-    cast_centroids_f16, cast_centroids_f16_mut, centroids_padded_bytes, cluster_block_bytes,
-    deserialize_tombstone_footer, serialize_tombstone_footer, OsiClusterSpan, OsiClusterView,
-    OsiHeader, RabitqEntryHeader,
+    cast_centroids_f16, cast_centroids_f16_mut, centroids_padded_bytes, centroids_unpadded_bytes,
+    cluster_block_bytes, deserialize_tombstone_footer, serialize_tombstone_footer, OsiClusterSpan,
+    OsiClusterView, OsiHeader, RabitqEntryHeader,
 };
 use crate::format::{checked_align_up_64, FORMAT_KIND_OSI, FORMAT_VERSION_V1, OSPREY_MAGIC};
 use crate::math::{
@@ -70,6 +74,36 @@ pub trait RabitqScanKernel: RabitqFwhtKernel {
         query_abs_sum: i32,
         db_bits: &[u64],
     ) -> i32;
+
+    /// Computes the exact `f32 x f16` inner product accumulated in `f32`.
+    #[inline]
+    fn dot_f32_f16(&self, a_f32: &[f32], b_f16: &[f16]) -> f32 {
+        dot_f32_f16_scalar(a_f32, b_f16)
+    }
+}
+
+/// Portable unrolled scalar `f32 x f16` dot product accumulated in `f32`.
+#[inline]
+pub fn dot_f32_f16_scalar(a_f32: &[f32], b_f16: &[f16]) -> f32 {
+    let n = a_f32.len().min(b_f16.len());
+    let mut acc0 = 0.0_f32;
+    let mut acc1 = 0.0_f32;
+    let mut acc2 = 0.0_f32;
+    let mut acc3 = 0.0_f32;
+    let mut i = 0usize;
+    while i + 4 <= n {
+        acc0 += a_f32[i] * b_f16[i].to_f32();
+        acc1 += a_f32[i + 1] * b_f16[i + 1].to_f32();
+        acc2 += a_f32[i + 2] * b_f16[i + 2].to_f32();
+        acc3 += a_f32[i + 3] * b_f16[i + 3].to_f32();
+        i += 4;
+    }
+    let mut sum = (acc0 + acc1) + (acc2 + acc3);
+    while i < n {
+        sum += a_f32[i] * b_f16[i].to_f32();
+        i += 1;
+    }
+    sum
 }
 
 /// Portable scalar implementation of [`RabitqFwhtKernel`] and [`RabitqScanKernel`] for
@@ -182,9 +216,13 @@ pub struct TransposedQuery4Bit {
 }
 
 impl TransposedQuery4Bit {
-    /// Quantizes `q_rot` symmetrically to `[-7, +7]` (`q_scale = q_max / 7.0`) and transposes
-    /// magnitude bit-planes and sign masks in registers without intermediate bit-matrix allocations.
-    pub fn from_rotated_query(q_rot: &[f32]) -> Self {
+    /// Quantizes `q_rot` symmetrically to `[-7, +7]` into caller-supplied reusable buffers,
+    /// returning `(query_abs_sum, q_scale)` without heap reallocations once warmed up.
+    pub fn quantize_into_slices(
+        q_rot: &[f32],
+        planes: &mut Vec<[u64; 4]>,
+        sign_mask: &mut Vec<u64>,
+    ) -> (i32, f32) {
         let mut q_max = 0.0_f32;
         for &val in q_rot {
             if val.is_finite() {
@@ -202,8 +240,10 @@ impl TransposedQuery4Bit {
         let inv_scale = 1.0_f32 / q_scale;
 
         let n_words = q_rot.len().div_ceil(64);
-        let mut planes = Vec::with_capacity(n_words);
-        let mut sign_mask = Vec::with_capacity(n_words);
+        planes.clear();
+        planes.reserve(n_words);
+        sign_mask.clear();
+        sign_mask.reserve(n_words);
         let mut query_abs_sum = 0_i32;
 
         for chunk in q_rot.chunks(64) {
@@ -244,6 +284,16 @@ impl TransposedQuery4Bit {
             sign_mask.push(s_mask);
         }
 
+        (query_abs_sum, q_scale)
+    }
+
+    /// Quantizes `q_rot` symmetrically to `[-7, +7]` (`q_scale = q_max / 7.0`) and transposes
+    /// magnitude bit-planes and sign masks in registers without intermediate bit-matrix allocations.
+    pub fn from_rotated_query(q_rot: &[f32]) -> Self {
+        let mut planes = Vec::new();
+        let mut sign_mask = Vec::new();
+        let (query_abs_sum, q_scale) =
+            Self::quantize_into_slices(q_rot, &mut planes, &mut sign_mask);
         Self {
             planes,
             sign_mask,
@@ -532,11 +582,82 @@ pub fn encode_rabitq_residual_scalar(
 /// `RabitqEntryHeader` metadata, 64-byte-aligned 1-bit codes, and `RoaringBitmap` tombstones.
 pub struct OsiIndex {
     header: OsiHeader,
+    signs: RademacherSigns,
     centroids_f16: AlignedBuffer<f16>,
     cluster_offsets: Vec<u32>,
     entries: Vec<RabitqEntryHeader>,
     codes: AlignedBuffer<u64>,
     tombstones: RoaringBitmap,
+}
+
+#[derive(Default)]
+struct ScanScratch {
+    q_buf: Vec<f32>,
+    planes: Vec<[u64; 4]>,
+    sign_mask: Vec<u64>,
+    probed: Vec<ProbedCluster>,
+}
+
+thread_local! {
+    static SCAN_SCRATCH: RefCell<ScanScratch> = RefCell::new(ScanScratch::default());
+}
+
+#[inline]
+fn with_scan_scratch<R>(f: impl FnOnce(&mut ScanScratch) -> R) -> R {
+    let mut f_opt = Some(f);
+    let tls_res = SCAN_SCRATCH.try_with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            f_opt.take().map(|func| func(&mut guard))
+        } else {
+            None
+        }
+    });
+    if let Ok(Some(val)) = tls_res {
+        return val;
+    }
+    let mut local = ScanScratch::default();
+    if let Some(func) = f_opt {
+        return func(&mut local);
+    }
+    unreachable!()
+}
+
+enum OsiBacking {
+    Mmap(Mmap),
+    Aligned(AlignedBuffer<u8>),
+}
+
+impl OsiBacking {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mmap(m) => m.as_ref(),
+            Self::Aligned(buf) => buf.as_slice(),
+        }
+    }
+}
+
+/// Zero-copy resident `.osi` index backed directly by `memmap2::Mmap` or a single
+/// 64-byte-aligned buffer, eliminating heap copies of centroids, codes, and entry headers.
+pub struct OsiMappedIndex {
+    backing: OsiBacking,
+    header: OsiHeader,
+    signs: RademacherSigns,
+    centroids_start: usize,
+    centroids_end: usize,
+    entries_start: usize,
+    cluster_offsets: Vec<u32>,
+    tombstones: RoaringBitmap,
+}
+
+impl std::fmt::Debug for OsiMappedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OsiMappedIndex")
+            .field("header", &self.header)
+            .field("clusters", &self.cluster_offsets.len().saturating_sub(1))
+            .field("tombstones_len", &self.tombstones.len())
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for OsiIndex {
@@ -1134,6 +1255,7 @@ impl OsiIndex {
             .map_err(|_| OspreyError::InvalidDimension { dim: padded_dim })?;
         let n_u64 = u64::try_from(n).map_err(|_| OspreyError::InvalidDimension { dim: n })?;
 
+        let signs = RademacherSigns::from_seed(padded_dim, fwht_seed)?;
         let header = compute_sealed_osi_header(
             flags,
             orig_dim_u16,
@@ -1146,6 +1268,7 @@ impl OsiIndex {
 
         Ok(Self {
             header,
+            signs,
             centroids_f16,
             cluster_offsets,
             entries,
@@ -1397,8 +1520,10 @@ impl OsiIndex {
             cluster_offsets.push(running);
         }
 
+        let signs = RademacherSigns::from_seed(usize::from(header.padded_dim), header.fwht_seed)?;
         Ok(Self {
             header,
+            signs,
             centroids_f16,
             cluster_offsets,
             entries,
@@ -1436,62 +1561,17 @@ impl OsiIndex {
     /// Selects the top `nprobe` clusters (`1 <= effective_nprobe <= K`) maximizing exact
     /// `f16`-promoted inner product `<q_vec, c_k>` using a stack-allocated `BoundedTopKHeap`.
     pub fn probe_clusters(&self, q_vec: &[f32], nprobe: usize) -> OspreyResult<Vec<ProbedCluster>> {
-        let padded_dim = usize::from(self.header.padded_dim);
-        if q_vec.len() != padded_dim {
-            return Err(OspreyError::InvalidDimension { dim: q_vec.len() });
-        }
-        for (index, &val) in q_vec.iter().enumerate() {
-            if !val.is_finite() {
-                return Err(OspreyError::NonFiniteEmbedding { index });
-            }
-        }
-        let k_total = usize::try_from(self.header.num_clusters)
-            .map_err(|_| OspreyError::InvalidDimension { dim: usize::MAX })?;
-        let eff_nprobe = nprobe.min(k_total);
-        if eff_nprobe == 0 {
-            return Ok(Vec::new());
-        }
-
-        if eff_nprobe <= 512 {
-            self.probe_clusters_with_cap::<512>(q_vec, k_total, eff_nprobe)
-        } else if eff_nprobe <= 4096 {
-            self.probe_clusters_with_cap::<4096>(q_vec, k_total, eff_nprobe)
-        } else {
-            Err(OspreyError::InvalidDimension { dim: eff_nprobe })
-        }
-    }
-
-    fn probe_clusters_with_cap<const CAP: usize>(
-        &self,
-        q_vec: &[f32],
-        k_total: usize,
-        eff_nprobe: usize,
-    ) -> OspreyResult<Vec<ProbedCluster>> {
-        let padded_dim = usize::from(self.header.padded_dim);
-        let mut heap = BoundedTopKHeap::<CAP>::try_new(eff_nprobe)?;
-        let centroids = self.centroids_f16.as_slice();
-
-        for k in 0..k_total {
-            let centroid = &centroids[k * padded_dim..(k + 1) * padded_dim];
-            let mut dot = 0.0_f32;
-            for (&q_val, &c_f16) in q_vec.iter().zip(centroid.iter()) {
-                dot += q_val * c_f16.to_f32();
-            }
-            let k_u32 = u32::try_from(k).map_err(|_| OspreyError::InvalidDimension { dim: k })?;
-            heap.push(ScoredCandidate {
-                score: dot,
-                doc_id: u64::from(k_u32),
-                entry_idx: k_u32,
-                minipage_id: 0,
-                slot_idx: 0,
-            });
-        }
-
-        Ok(heap
-            .into_sorted_slice()
-            .iter()
-            .map(|c| (c.entry_idx, c.score))
-            .collect())
+        let mut out = Vec::new();
+        probe_clusters_into(
+            self.centroids_f16.as_slice(),
+            self.header.num_clusters,
+            self.header.padded_dim,
+            q_vec,
+            nprobe,
+            &ScalarRabitqKernel,
+            &mut out,
+        )?;
+        Ok(out)
     }
 
     /// Normalizes and zero-pads a raw `query` (`orig_dim`) to `q_padded` and selects the top
@@ -1534,9 +1614,77 @@ impl OsiIndex {
         simd: &K,
         allowed_docs: Option<&RoaringBitmap>,
     ) -> OspreyResult<Vec<ScoredCandidate>> {
-        self.search_candidates_filtered_with(query, nprobe, top_m, simd, |_entry_idx, doc_id| {
-            allowed_docs.is_none_or(|bm| u32::try_from(doc_id).is_ok_and(|id| bm.contains(id)))
-        })
+        let words_per_vec = self.words_per_vec();
+        let all_codes = self.codes.as_slice();
+        let all_entries = &self.entries;
+        let cluster_offsets = &self.cluster_offsets;
+        let cluster_accessor = |k_idx: usize| -> OspreyResult<(&[RabitqEntryHeader], &[u64], u32)> {
+            let start = usize::try_from(
+                *cluster_offsets
+                    .get(k_idx)
+                    .ok_or(OspreyError::InvalidDimension { dim: k_idx })?,
+            )
+            .map_err(|_| OspreyError::CorruptedFooter)?;
+            let end = usize::try_from(
+                *cluster_offsets
+                    .get(k_idx + 1)
+                    .ok_or(OspreyError::InvalidDimension { dim: k_idx + 1 })?,
+            )
+            .map_err(|_| OspreyError::CorruptedFooter)?;
+            let base_idx = u32::try_from(start).unwrap_or(u32::MAX);
+            Ok((
+                &all_entries[start..end],
+                &all_codes[start * words_per_vec..end * words_per_vec],
+                base_idx,
+            ))
+        };
+
+        match (self.tombstones.is_empty(), allowed_docs) {
+            (true, None) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                self.centroids_f16.as_slice(),
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &NoFilter,
+                cluster_accessor,
+            ),
+            (false, None) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                self.centroids_f16.as_slice(),
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &TombstoneFilter(&self.tombstones),
+                cluster_accessor,
+            ),
+            (true, Some(bm)) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                self.centroids_f16.as_slice(),
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &AllowedBitmapFilter(bm),
+                cluster_accessor,
+            ),
+            (false, Some(bm)) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                self.centroids_f16.as_slice(),
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &TombstoneAndAllowedFilter(&self.tombstones, bm),
+                cluster_accessor,
+            ),
+        }
     }
 
     /// Executes Stage-1 asymmetric `RaBitQ` search using a caller-supplied $O(1)$ entry/doc
@@ -1552,139 +1700,625 @@ impl OsiIndex {
     where
         F: Fn(u32, u64) -> bool,
     {
-        let orig_dim = usize::from(self.header.orig_dim);
-        let padded_dim = usize::from(self.header.padded_dim);
-        if query.len() != orig_dim {
-            return Err(OspreyError::InvalidDimension { dim: query.len() });
-        }
-
-        let mut q_buf = vec![0.0_f32; padded_dim];
-        prepare_and_pad_vector(query, &mut q_buf)?;
-
-        if nprobe == 0 || top_m == 0 || self.header.num_vectors == 0 {
-            return Ok(Vec::new());
-        }
-
-        let signs = RademacherSigns::from_seed(padded_dim, self.header.fwht_seed)?;
-        let probed = if (self.header.flags & OSI_FLAG_UNROTATED_CENTROIDS) != 0 {
-            // Centroids stored in unrotated padded space: probe with `q_padded`, then rotate for residuals.
-            let p = self.probe_clusters(&q_buf, nprobe)?;
-            simd.fwht_rotate_in_place(&mut q_buf, signs.xor_masks())?;
-            p
-        } else {
-            // Canonical `.osi`: centroids & residuals share FWHT-rotated space (`ARCHITECTURE.md` §3.3).
-            simd.fwht_rotate_in_place(&mut q_buf, signs.xor_masks())?;
-            self.probe_clusters(&q_buf, nprobe)?
-        };
-
-        let q_transposed = TransposedQuery4Bit::try_from_rotated_query(&q_buf)?;
-
-        if top_m <= 512 {
-            self.scan_probed_clusters::<512, K, F>(
-                &probed,
-                &q_transposed,
-                top_m,
-                simd,
-                &allow_entry,
-            )
-        } else if top_m <= 4096 {
-            self.scan_probed_clusters::<4096, K, F>(
-                &probed,
-                &q_transposed,
-                top_m,
-                simd,
-                &allow_entry,
-            )
-        } else {
-            Err(OspreyError::InvalidDimension { dim: top_m })
-        }
-    }
-
-    fn scan_probed_clusters<const CAP: usize, K: RabitqScanKernel + ?Sized, F>(
-        &self,
-        probed: &[(u32, f32)],
-        q_transposed: &TransposedQuery4Bit,
-        top_m: usize,
-        simd: &K,
-        allow_entry: &F,
-    ) -> OspreyResult<Vec<ScoredCandidate>>
-    where
-        F: Fn(u32, u64) -> bool,
-    {
-        let mut heap = BoundedTopKHeap::<CAP>::try_new(top_m)?;
         let words_per_vec = self.words_per_vec();
-        let inv_dim = 1.0_f32 / f32::from(self.header.padded_dim);
-        let q_scale = q_transposed.q_scale;
-        let query_abs_sum = q_transposed.query_abs_sum;
-        let q_planes = q_transposed.planes.as_slice();
-        let q_signs = q_transposed.sign_mask.as_slice();
         let all_codes = self.codes.as_slice();
-
-        for &(cluster_id, centroid_ip) in probed {
-            let k_idx = usize::try_from(cluster_id)
-                .map_err(|_| OspreyError::InvalidDimension { dim: usize::MAX })?;
+        let all_entries = &self.entries;
+        let cluster_offsets = &self.cluster_offsets;
+        let cluster_accessor = |k_idx: usize| -> OspreyResult<(&[RabitqEntryHeader], &[u64], u32)> {
             let start = usize::try_from(
-                *self
-                    .cluster_offsets
+                *cluster_offsets
                     .get(k_idx)
                     .ok_or(OspreyError::InvalidDimension { dim: k_idx })?,
             )
             .map_err(|_| OspreyError::CorruptedFooter)?;
             let end = usize::try_from(
-                *self
-                    .cluster_offsets
+                *cluster_offsets
                     .get(k_idx + 1)
                     .ok_or(OspreyError::InvalidDimension { dim: k_idx + 1 })?,
             )
             .map_err(|_| OspreyError::CorruptedFooter)?;
+            let base_idx = u32::try_from(start).unwrap_or(u32::MAX);
+            Ok((
+                &all_entries[start..end],
+                &all_codes[start * words_per_vec..end * words_per_vec],
+                base_idx,
+            ))
+        };
 
-            const PREFETCH_AHEAD: usize = 2;
-            for entry_idx in start..end {
-                if entry_idx + PREFETCH_AHEAD < end {
-                    let pf_idx = entry_idx + PREFETCH_AHEAD;
-                    let pf_code_start = pf_idx * words_per_vec;
-                    let pf_code_end = pf_code_start + words_per_vec;
-                    let pf_bytes: &[u8] =
-                        bytemuck::cast_slice(&all_codes[pf_code_start..pf_code_end]);
-                    simd.prefetch_l1(pf_bytes);
-                    if pf_bytes.len() > 64 {
-                        simd.prefetch_l1(&pf_bytes[64..]);
-                    }
-                    simd.prefetch_l1(bytemuck::bytes_of(&self.entries[pf_idx]));
-                }
+        if self.tombstones.is_empty() {
+            search_candidates_impl(
+                &self.header,
+                &self.signs,
+                self.centroids_f16.as_slice(),
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &ClosureFilter(&allow_entry),
+                cluster_accessor,
+            )
+        } else {
+            search_candidates_impl(
+                &self.header,
+                &self.signs,
+                self.centroids_f16.as_slice(),
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &TombstoneAndClosureFilter(&self.tombstones, &allow_entry),
+                cluster_accessor,
+            )
+        }
+    }
+}
 
-                let entry = &self.entries[entry_idx];
-                let entry_idx_u32 = u32::try_from(entry_idx).unwrap_or(u32::MAX);
+impl OsiMappedIndex {
+    /// Opens and memory-maps an `.osi` file zero-copy via `memmap2::Mmap`, validating
+    /// all headers, checksums, and cluster spans upfront and precomputing `RademacherSigns`.
+    pub fn open_mmap<P: AsRef<Path>>(path: P) -> OspreyResult<Self> {
+        let file = File::open(path)?;
+        // SAFETY: `.osi` segment files are immutable for the lifetime of the read-only mapping.
+        let mmap = unsafe { Mmap::map(&file)? };
+        Self::from_backing(OsiBacking::Mmap(mmap))
+    }
 
-                // O(1) RoaringBitmap tombstone & scalar filter check prior to SIMD scan.
-                if self.is_deleted(entry.doc_id) || !allow_entry(entry_idx_u32, entry.doc_id) {
-                    continue;
-                }
+    /// Wraps a 64-byte-aligned `.osi` buffer zero-copy without copying centroids, codes,
+    /// or entry headers into secondary heap allocations.
+    pub fn from_aligned_buffer(buffer: AlignedBuffer<u8>) -> OspreyResult<Self> {
+        Self::from_backing(OsiBacking::Aligned(buffer))
+    }
 
-                let code_start = entry_idx * words_per_vec;
-                let entry_bits = &all_codes[code_start..code_start + words_per_vec];
-                let dot_int =
-                    simd.rabitq_4bit_dot_u64(q_planes, q_signs, query_abs_sum, entry_bits);
+    fn from_backing(backing: OsiBacking) -> OspreyResult<Self> {
+        let (
+            header,
+            signs,
+            centroids_start,
+            centroids_end,
+            entries_start,
+            cluster_offsets,
+            tombstones,
+        ) = {
+            let bytes = backing.as_slice();
+            let view = OsiMappedView::from_bytes(bytes)?;
+            let header = *view.header();
+            let padded_dim = usize::from(header.padded_dim);
+            let signs = RademacherSigns::from_seed(padded_dim, header.fwht_seed)?;
+            let centroids_start = usize::try_from(header.centroids_offset)
+                .map_err(|_| OspreyError::CorruptedFooter)?;
+            let centroids_len = centroids_unpadded_bytes(header.num_clusters, header.padded_dim)?;
+            let centroids_end = centroids_start
+                .checked_add(centroids_len)
+                .ok_or(OspreyError::CorruptedFooter)?;
+            let entries_start =
+                usize::try_from(header.entries_offset).map_err(|_| OspreyError::CorruptedFooter)?;
 
-                // Unbiased asymmetric RaBitQ estimator reconstruction.
-                let res_norm = entry.res_norm.to_f32();
-                let l1_factor = entry.l1_norm_factor.to_f32().max(RABITQ_L1_MIN_NORMAL_F32);
-                #[allow(clippy::cast_precision_loss)]
-                let est_score =
-                    centroid_ip + res_norm * (((dot_int as f32) * q_scale) * inv_dim / l1_factor);
+            let spans = view.cluster_spans();
+            let mut cluster_offsets = Vec::with_capacity(spans.len() + 1);
+            cluster_offsets.push(0_u32);
+            let mut running = 0_u32;
+            for span in spans {
+                running = running
+                    .checked_add(span.vector_count)
+                    .ok_or(OspreyError::CorruptedFooter)?;
+                cluster_offsets.push(running);
+            }
 
-                heap.push(ScoredCandidate {
-                    score: est_score,
-                    doc_id: entry.doc_id,
-                    entry_idx: entry_idx_u32,
-                    minipage_id: entry.minipage_id,
-                    slot_idx: entry.slot_idx,
-                });
+            (
+                header,
+                signs,
+                centroids_start,
+                centroids_end,
+                entries_start,
+                cluster_offsets,
+                view.tombstones().clone(),
+            )
+        };
+
+        Ok(Self {
+            backing,
+            header,
+            signs,
+            centroids_start,
+            centroids_end,
+            entries_start,
+            cluster_offsets,
+            tombstones,
+        })
+    }
+
+    /// Returns the validated `.osi` header.
+    #[inline]
+    pub const fn header(&self) -> &OsiHeader {
+        &self.header
+    }
+
+    /// Returns the flat `K * padded_dim` `f16` centroid slice mapped zero-copy.
+    #[inline]
+    pub fn centroids_f16(&self) -> &[f16] {
+        let slice = &self.backing.as_slice()[self.centroids_start..self.centroids_end];
+        bytemuck::try_cast_slice(slice).unwrap_or(&[])
+    }
+
+    /// Returns the `RoaringBitmap` of logically deleted document IDs.
+    #[inline]
+    pub const fn tombstones(&self) -> &RoaringBitmap {
+        &self.tombstones
+    }
+
+    /// Returns `true` if `doc_id` is marked deleted in the `.osi` tombstone bitmap.
+    #[inline]
+    pub fn is_deleted(&self, doc_id: u64) -> bool {
+        u32::try_from(doc_id).is_ok_and(|id| self.tombstones.contains(id))
+    }
+
+    #[inline]
+    fn cluster_slices(&self, k_idx: usize) -> OspreyResult<(&[RabitqEntryHeader], &[u64], u32)> {
+        let bytes = self.backing.as_slice();
+        let k_total = usize::try_from(self.header.num_clusters)
+            .map_err(|_| OspreyError::InvalidDimension { dim: usize::MAX })?;
+        if k_idx >= k_total {
+            return Err(OspreyError::InvalidDimension { dim: k_idx });
+        }
+        let spans_bytes = k_total * size_of::<OsiClusterSpan>();
+        let spans: &[OsiClusterSpan] =
+            bytemuck::try_cast_slice(&bytes[self.entries_start..self.entries_start + spans_bytes])
+                .map_err(|_| OspreyError::CorruptedFooter)?;
+        let span = spans[k_idx];
+        let rel_off =
+            usize::try_from(span.cluster_offset).map_err(|_| OspreyError::CorruptedFooter)?;
+        let vec_count =
+            usize::try_from(span.vector_count).map_err(|_| OspreyError::CorruptedFooter)?;
+        let block_len = cluster_block_bytes(vec_count, self.header.padded_dim)?;
+        let block_start = self.entries_start + rel_off;
+        let cluster_view = OsiClusterView::from_cluster_bytes(
+            &bytes[block_start..block_start + block_len],
+            vec_count,
+            self.header.padded_dim,
+        )?;
+        let base_idx = self.cluster_offsets.get(k_idx).copied().unwrap_or(0);
+        Ok((cluster_view.entries, cluster_view.codes, base_idx))
+    }
+
+    /// Executes Stage-1 asymmetric `RaBitQ` search zero-copy over the mapped `.osi`.
+    pub fn search_candidates<K: RabitqScanKernel + ?Sized>(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        top_m: usize,
+        simd: &K,
+    ) -> OspreyResult<Vec<ScoredCandidate>> {
+        self.search_candidates_filtered(query, nprobe, top_m, simd, None)
+    }
+
+    /// Executes Stage-1 asymmetric `RaBitQ` search with an optional allowed-doc bitmap filter.
+    pub fn search_candidates_filtered<K: RabitqScanKernel + ?Sized>(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        top_m: usize,
+        simd: &K,
+        allowed_docs: Option<&RoaringBitmap>,
+    ) -> OspreyResult<Vec<ScoredCandidate>> {
+        let centroids = self.centroids_f16();
+        let cluster_accessor = |k_idx: usize| self.cluster_slices(k_idx);
+        match (self.tombstones.is_empty(), allowed_docs) {
+            (true, None) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                centroids,
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &NoFilter,
+                cluster_accessor,
+            ),
+            (false, None) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                centroids,
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &TombstoneFilter(&self.tombstones),
+                cluster_accessor,
+            ),
+            (true, Some(bm)) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                centroids,
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &AllowedBitmapFilter(bm),
+                cluster_accessor,
+            ),
+            (false, Some(bm)) => search_candidates_impl(
+                &self.header,
+                &self.signs,
+                centroids,
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &TombstoneAndAllowedFilter(&self.tombstones, bm),
+                cluster_accessor,
+            ),
+        }
+    }
+
+    /// Executes Stage-1 asymmetric `RaBitQ` search with a caller-supplied predicate zero-copy.
+    pub fn search_candidates_filtered_with<K: RabitqScanKernel + ?Sized, F>(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        top_m: usize,
+        simd: &K,
+        allow_entry: F,
+    ) -> OspreyResult<Vec<ScoredCandidate>>
+    where
+        F: Fn(u32, u64) -> bool,
+    {
+        let centroids = self.centroids_f16();
+        let cluster_accessor = |k_idx: usize| self.cluster_slices(k_idx);
+        if self.tombstones.is_empty() {
+            search_candidates_impl(
+                &self.header,
+                &self.signs,
+                centroids,
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &ClosureFilter(&allow_entry),
+                cluster_accessor,
+            )
+        } else {
+            search_candidates_impl(
+                &self.header,
+                &self.signs,
+                centroids,
+                query,
+                nprobe,
+                top_m,
+                simd,
+                &TombstoneAndClosureFilter(&self.tombstones, &allow_entry),
+                cluster_accessor,
+            )
+        }
+    }
+}
+
+trait EntryFilter {
+    fn allow(&self, entry_idx: u32, doc_id: u64) -> bool;
+}
+
+struct NoFilter;
+impl EntryFilter for NoFilter {
+    #[inline(always)]
+    fn allow(&self, _entry_idx: u32, _doc_id: u64) -> bool {
+        true
+    }
+}
+
+struct TombstoneFilter<'a>(&'a RoaringBitmap);
+impl EntryFilter for TombstoneFilter<'_> {
+    #[inline(always)]
+    fn allow(&self, _entry_idx: u32, doc_id: u64) -> bool {
+        !u32::try_from(doc_id).is_ok_and(|id| self.0.contains(id))
+    }
+}
+
+struct AllowedBitmapFilter<'a>(&'a RoaringBitmap);
+impl EntryFilter for AllowedBitmapFilter<'_> {
+    #[inline(always)]
+    fn allow(&self, _entry_idx: u32, doc_id: u64) -> bool {
+        u32::try_from(doc_id).is_ok_and(|id| self.0.contains(id))
+    }
+}
+
+struct TombstoneAndAllowedFilter<'a>(&'a RoaringBitmap, &'a RoaringBitmap);
+impl EntryFilter for TombstoneAndAllowedFilter<'_> {
+    #[inline(always)]
+    fn allow(&self, _entry_idx: u32, doc_id: u64) -> bool {
+        u32::try_from(doc_id).is_ok_and(|id| !self.0.contains(id) && self.1.contains(id))
+    }
+}
+
+struct ClosureFilter<'a, F>(&'a F);
+impl<F: Fn(u32, u64) -> bool> EntryFilter for ClosureFilter<'_, F> {
+    #[inline(always)]
+    fn allow(&self, entry_idx: u32, doc_id: u64) -> bool {
+        (self.0)(entry_idx, doc_id)
+    }
+}
+
+struct TombstoneAndClosureFilter<'a, F>(&'a RoaringBitmap, &'a F);
+impl<F: Fn(u32, u64) -> bool> EntryFilter for TombstoneAndClosureFilter<'_, F> {
+    #[inline(always)]
+    fn allow(&self, entry_idx: u32, doc_id: u64) -> bool {
+        !u32::try_from(doc_id).is_ok_and(|id| self.0.contains(id)) && (self.1)(entry_idx, doc_id)
+    }
+}
+
+fn probe_clusters_into<K: RabitqScanKernel + ?Sized>(
+    centroids: &[f16],
+    num_clusters: u32,
+    padded_dim_u16: u16,
+    q_vec: &[f32],
+    nprobe: usize,
+    simd: &K,
+    out: &mut Vec<ProbedCluster>,
+) -> OspreyResult<()> {
+    let padded_dim = usize::from(padded_dim_u16);
+    if q_vec.len() != padded_dim {
+        return Err(OspreyError::InvalidDimension { dim: q_vec.len() });
+    }
+    for (index, &val) in q_vec.iter().enumerate() {
+        if !val.is_finite() {
+            return Err(OspreyError::NonFiniteEmbedding { index });
+        }
+    }
+    let k_total = usize::try_from(num_clusters)
+        .map_err(|_| OspreyError::InvalidDimension { dim: usize::MAX })?;
+    let eff_nprobe = nprobe.min(k_total);
+    out.clear();
+    if eff_nprobe == 0 {
+        return Ok(());
+    }
+
+    if eff_nprobe <= 64 {
+        probe_clusters_cap::<64, K>(centroids, padded_dim, q_vec, k_total, eff_nprobe, simd, out)
+    } else if eff_nprobe <= 256 {
+        probe_clusters_cap::<256, K>(centroids, padded_dim, q_vec, k_total, eff_nprobe, simd, out)
+    } else if eff_nprobe <= 512 {
+        probe_clusters_cap::<512, K>(centroids, padded_dim, q_vec, k_total, eff_nprobe, simd, out)
+    } else if eff_nprobe <= 4096 {
+        probe_clusters_cap::<4096, K>(centroids, padded_dim, q_vec, k_total, eff_nprobe, simd, out)
+    } else {
+        Err(OspreyError::InvalidDimension { dim: eff_nprobe })
+    }
+}
+
+fn probe_clusters_cap<const CAP: usize, K: RabitqScanKernel + ?Sized>(
+    centroids: &[f16],
+    padded_dim: usize,
+    q_vec: &[f32],
+    k_total: usize,
+    eff_nprobe: usize,
+    simd: &K,
+    out: &mut Vec<ProbedCluster>,
+) -> OspreyResult<()> {
+    let mut heap = BoundedTopKHeap::<CAP>::try_new(eff_nprobe)?;
+    for k in 0..k_total {
+        let centroid = &centroids[k * padded_dim..(k + 1) * padded_dim];
+        let dot = simd.dot_f32_f16(q_vec, centroid);
+        let k_u32 = u32::try_from(k).map_err(|_| OspreyError::InvalidDimension { dim: k })?;
+        heap.push(ScoredCandidate {
+            score: dot,
+            doc_id: u64::from(k_u32),
+            entry_idx: k_u32,
+            minipage_id: 0,
+            slot_idx: 0,
+        });
+    }
+    out.extend(
+        heap.into_sorted_slice()
+            .iter()
+            .map(|c| (c.entry_idx, c.score)),
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_candidates_impl<'a, K, F, A>(
+    header: &OsiHeader,
+    signs: &RademacherSigns,
+    centroids_f16: &[f16],
+    query: &[f32],
+    nprobe: usize,
+    top_m: usize,
+    simd: &K,
+    filter: &F,
+    cluster_accessor: A,
+) -> OspreyResult<Vec<ScoredCandidate>>
+where
+    K: RabitqScanKernel + ?Sized,
+    F: EntryFilter,
+    A: Fn(usize) -> OspreyResult<(&'a [RabitqEntryHeader], &'a [u64], u32)>,
+{
+    let orig_dim = usize::from(header.orig_dim);
+    let padded_dim = usize::from(header.padded_dim);
+    if query.len() != orig_dim {
+        return Err(OspreyError::InvalidDimension { dim: query.len() });
+    }
+    if nprobe == 0 || top_m == 0 || header.num_vectors == 0 {
+        // Still validate finiteness of `query` even when returning empty.
+        for (index, &val) in query.iter().enumerate() {
+            if !val.is_finite() {
+                return Err(OspreyError::NonFiniteEmbedding { index });
             }
         }
-
-        Ok(heap.into_sorted_slice().to_vec())
+        return Ok(Vec::new());
     }
+
+    with_scan_scratch(|scratch| {
+        if scratch.q_buf.len() != padded_dim {
+            scratch.q_buf.resize(padded_dim, 0.0_f32);
+        }
+        prepare_and_pad_vector(query, &mut scratch.q_buf)?;
+
+        if (header.flags & OSI_FLAG_UNROTATED_CENTROIDS) != 0 {
+            probe_clusters_into(
+                centroids_f16,
+                header.num_clusters,
+                header.padded_dim,
+                &scratch.q_buf,
+                nprobe,
+                simd,
+                &mut scratch.probed,
+            )?;
+            simd.fwht_rotate_in_place(&mut scratch.q_buf, signs.xor_masks())?;
+        } else {
+            simd.fwht_rotate_in_place(&mut scratch.q_buf, signs.xor_masks())?;
+            probe_clusters_into(
+                centroids_f16,
+                header.num_clusters,
+                header.padded_dim,
+                &scratch.q_buf,
+                nprobe,
+                simd,
+                &mut scratch.probed,
+            )?;
+        }
+
+        let (query_abs_sum, q_scale) = TransposedQuery4Bit::quantize_into_slices(
+            &scratch.q_buf,
+            &mut scratch.planes,
+            &mut scratch.sign_mask,
+        );
+
+        let words_per_vec = padded_dim / 64;
+        let inv_dim = 1.0_f32 / f32::from(header.padded_dim);
+        let q_planes = scratch.planes.as_slice();
+        let q_signs = scratch.sign_mask.as_slice();
+        let probed = scratch.probed.as_slice();
+
+        if top_m <= 512 {
+            scan_probed_clusters_cap::<512, K, F, A>(
+                probed,
+                words_per_vec,
+                inv_dim,
+                q_scale,
+                query_abs_sum,
+                q_planes,
+                q_signs,
+                top_m,
+                simd,
+                filter,
+                cluster_accessor,
+            )
+        } else if top_m <= 1024 {
+            scan_probed_clusters_cap::<1024, K, F, A>(
+                probed,
+                words_per_vec,
+                inv_dim,
+                q_scale,
+                query_abs_sum,
+                q_planes,
+                q_signs,
+                top_m,
+                simd,
+                filter,
+                cluster_accessor,
+            )
+        } else if top_m <= 2048 {
+            scan_probed_clusters_cap::<2048, K, F, A>(
+                probed,
+                words_per_vec,
+                inv_dim,
+                q_scale,
+                query_abs_sum,
+                q_planes,
+                q_signs,
+                top_m,
+                simd,
+                filter,
+                cluster_accessor,
+            )
+        } else if top_m <= 4096 {
+            scan_probed_clusters_cap::<4096, K, F, A>(
+                probed,
+                words_per_vec,
+                inv_dim,
+                q_scale,
+                query_abs_sum,
+                q_planes,
+                q_signs,
+                top_m,
+                simd,
+                filter,
+                cluster_accessor,
+            )
+        } else {
+            Err(OspreyError::InvalidDimension { dim: top_m })
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_probed_clusters_cap<'a, const CAP: usize, K, F, A>(
+    probed: &[(u32, f32)],
+    words_per_vec: usize,
+    inv_dim: f32,
+    q_scale: f32,
+    query_abs_sum: i32,
+    q_planes: &[[u64; 4]],
+    q_signs: &[u64],
+    top_m: usize,
+    simd: &K,
+    filter: &F,
+    cluster_accessor: A,
+) -> OspreyResult<Vec<ScoredCandidate>>
+where
+    K: RabitqScanKernel + ?Sized,
+    F: EntryFilter,
+    A: Fn(usize) -> OspreyResult<(&'a [RabitqEntryHeader], &'a [u64], u32)>,
+{
+    let mut heap = BoundedTopKHeap::<CAP>::try_new(top_m)?;
+    let q_scale_inv_dim = q_scale * inv_dim;
+    const PREFETCH_AHEAD: usize = 2;
+
+    for &(cluster_id, centroid_ip) in probed {
+        let k_idx = usize::try_from(cluster_id)
+            .map_err(|_| OspreyError::InvalidDimension { dim: usize::MAX })?;
+        let (cluster_entries, cluster_codes, base_entry_idx) = cluster_accessor(k_idx)?;
+        let count = cluster_entries.len();
+
+        for (local_idx, entry) in cluster_entries.iter().enumerate() {
+            if local_idx + PREFETCH_AHEAD < count {
+                let pf_idx = local_idx + PREFETCH_AHEAD;
+                let pf_code_start = pf_idx * words_per_vec;
+                let pf_code_end = pf_code_start + words_per_vec;
+                let pf_bytes: &[u8] =
+                    bytemuck::cast_slice(&cluster_codes[pf_code_start..pf_code_end]);
+                simd.prefetch_l1(pf_bytes);
+                if pf_bytes.len() > 64 {
+                    simd.prefetch_l1(&pf_bytes[64..]);
+                }
+                simd.prefetch_l1(bytemuck::bytes_of(&cluster_entries[pf_idx]));
+            }
+
+            let entry_idx_u32 =
+                base_entry_idx.saturating_add(u32::try_from(local_idx).unwrap_or(u32::MAX));
+            if !filter.allow(entry_idx_u32, entry.doc_id) {
+                continue;
+            }
+
+            let code_start = local_idx * words_per_vec;
+            let entry_bits = &cluster_codes[code_start..code_start + words_per_vec];
+            let dot_int = simd.rabitq_4bit_dot_u64(q_planes, q_signs, query_abs_sum, entry_bits);
+
+            let res_norm = entry.res_norm.to_f32();
+            let l1_factor = entry.l1_norm_factor.to_f32().max(RABITQ_L1_MIN_NORMAL_F32);
+            #[allow(clippy::cast_precision_loss)]
+            let est_score =
+                centroid_ip + res_norm * (((dot_int as f32) * q_scale_inv_dim) / l1_factor);
+
+            heap.push(ScoredCandidate {
+                score: est_score,
+                doc_id: entry.doc_id,
+                entry_idx: entry_idx_u32,
+                minipage_id: entry.minipage_id,
+                slot_idx: entry.slot_idx,
+            });
+        }
+    }
+
+    Ok(heap.into_sorted_slice().to_vec())
 }
 
 fn compute_sealed_osi_header(
@@ -2478,5 +3112,33 @@ mod tests {
             .search_candidates(query_alive, k, 10, &simd)
             .unwrap();
         assert_eq!(unrot_res[0].doc_id, 142);
+
+        // 3. Verify OsiMappedIndex matches OsiIndex identically (both aligned buffer & mmap)
+        let osi_bytes = index.to_aligned_bytes().unwrap();
+        let mapped_buf = OsiMappedIndex::from_aligned_buffer(osi_bytes).unwrap();
+        assert_eq!(
+            mapped_buf
+                .search_candidates(query_deleted, 4, 20, &simd)
+                .unwrap(),
+            res_deleted
+        );
+        assert_eq!(
+            mapped_buf
+                .search_candidates(query_alive, 4, 10, &simd)
+                .unwrap(),
+            res_alive
+        );
+
+        let mut allowed = RoaringBitmap::new();
+        allowed.insert(142);
+        allowed.insert(150);
+        let filtered_owned = index
+            .search_candidates_filtered(query_alive, 4, 10, &simd, Some(&allowed))
+            .unwrap();
+        let filtered_mapped = mapped_buf
+            .search_candidates_filtered(query_alive, 4, 10, &simd, Some(&allowed))
+            .unwrap();
+        assert_eq!(filtered_owned, filtered_mapped);
+        assert_eq!(filtered_mapped[0].doc_id, 142);
     }
 }

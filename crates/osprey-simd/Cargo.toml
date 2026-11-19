@@ -14,9 +14,9 @@ categories.workspace = true
 
 [dependencies]
 osprey-core.workspace = true
+half.workspace = true
 
 [dev-dependencies]
-half.workspace = true
 proptest.workspace = true
 roaring.workspace = true
 

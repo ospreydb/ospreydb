@@ -131,6 +131,57 @@ impl<'a> MinipageView<'a> {
         Ok(())
     }
 
+    /// Returns a zero-copy `&[half::f16]` slice for `slot_idx` when the buffer is 2-byte aligned.
+    #[inline]
+    pub fn vector_f16_slice(&self, slot_idx: usize) -> Option<&'a [f16]> {
+        if slot_idx >= usize::from(self.vector_count) {
+            return None;
+        }
+        let dim = usize::from(self.orig_dim);
+        let start = slot_idx.checked_mul(dim)?.checked_mul(2)?;
+        let end = start.checked_add(dim.checked_mul(2)?)?;
+        let slice = self.vectors_le.get(start..end)?;
+        try_cast_slice(slice).ok()
+    }
+
+    /// Computes the exact `f32 x f16` inner product for `slot_idx` using SIMD F16C/AVX-512 when aligned.
+    #[inline]
+    pub fn compute_exact_f16_dot(&self, slot_idx: usize, query_f32: &[f32]) -> OspreyResult<f32> {
+        if slot_idx >= usize::from(self.vector_count) {
+            return Err(OspreyError::InvalidDimension { dim: slot_idx });
+        }
+        let dim = usize::from(self.orig_dim);
+        if query_f32.len() != dim {
+            return Err(OspreyError::InvalidDimension {
+                dim: query_f32.len(),
+            });
+        }
+        if let Some(vec_f16) = self.vector_f16_slice(slot_idx) {
+            return Ok(osprey_simd::dot_f32_f16(query_f32, vec_f16));
+        }
+        let start = slot_idx * dim * 2;
+        let slice = &self.vectors_le[start..start + dim * 2];
+        let (chunks, _) = slice.as_chunks::<2>();
+        let mut acc0 = 0.0_f32;
+        let mut acc1 = 0.0_f32;
+        let mut acc2 = 0.0_f32;
+        let mut acc3 = 0.0_f32;
+        let mut i = 0usize;
+        while i + 4 <= dim {
+            acc0 += f16::from_le_bytes(chunks[i]).to_f32() * query_f32[i];
+            acc1 += f16::from_le_bytes(chunks[i + 1]).to_f32() * query_f32[i + 1];
+            acc2 += f16::from_le_bytes(chunks[i + 2]).to_f32() * query_f32[i + 2];
+            acc3 += f16::from_le_bytes(chunks[i + 3]).to_f32() * query_f32[i + 3];
+            i += 4;
+        }
+        let mut sum = (acc0 + acc1) + (acc2 + acc3);
+        while i < dim {
+            sum += f16::from_le_bytes(chunks[i]).to_f32() * query_f32[i];
+            i += 1;
+        }
+        Ok(sum)
+    }
+
     /// Returns the payload byte slice for `slot_idx` without heap allocation.
     pub fn payload(&self, slot_idx: usize) -> OspreyResult<&'a [u8]> {
         if slot_idx >= usize::from(self.vector_count) {
@@ -230,6 +281,19 @@ pub struct OsvWriterConfig {
     pub max_dict_bytes: usize,
 }
 
+impl OsvWriterConfig {
+    /// Uncompressed `.osv` configuration (`zstd_level = 0`, no dictionary) for zero-copy local NVMe `mmap`.
+    #[inline]
+    pub const fn uncompressed() -> Self {
+        Self {
+            minipage_target_bytes: DEFAULT_MINIPAGE_TARGET_BYTES,
+            zstd_level: 0,
+            enable_zstd_dict: false,
+            max_dict_bytes: 0,
+        }
+    }
+}
+
 impl Default for OsvWriterConfig {
     #[inline]
     fn default() -> Self {
@@ -311,17 +375,26 @@ impl OsvWriter {
             permutation,
         )?;
 
-        let zstd_dict = if self.config.enable_zstd_dict && self.config.max_dict_bytes > 0 {
-            let sample_pages: Vec<Vec<u8>> = pages.iter().map(|p| p.bytes.clone()).collect();
-            train_payload_zstd_dictionary(&sample_pages, self.config.max_dict_bytes)?
+        let zstd_enabled = self.config.zstd_level != 0;
+        let zstd_dict =
+            if zstd_enabled && self.config.enable_zstd_dict && self.config.max_dict_bytes > 0 {
+                let sample_pages: Vec<Vec<u8>> = pages.iter().map(|p| p.bytes.clone()).collect();
+                train_payload_zstd_dictionary(&sample_pages, self.config.max_dict_bytes)?
+            } else {
+                Vec::new()
+            };
+
+        let compressed_pages = if zstd_enabled {
+            compress_minipages_parallel(&pages, self.config.zstd_level, &zstd_dict)?
         } else {
             Vec::new()
         };
 
-        let compressed_pages =
-            compress_minipages_parallel(&pages, self.config.zstd_level, &zstd_dict)?;
-
-        let mut flags = OSV_FLAG_ZSTD_ENABLED;
+        let mut flags = if zstd_enabled {
+            OSV_FLAG_ZSTD_ENABLED
+        } else {
+            0
+        };
         let (zstd_dict_offset, zstd_dict_len, slabs_offset) = if zstd_dict.is_empty() {
             (0_u64, 0_u64, 64_u64)
         } else {
@@ -342,45 +415,84 @@ impl OsvWriter {
         };
 
         let mut cursor = slabs_offset;
-        let mut directory = Vec::with_capacity(compressed_pages.len());
+        let page_count = if zstd_enabled {
+            compressed_pages.len()
+        } else {
+            pages.len()
+        };
+        let mut directory = Vec::with_capacity(page_count);
         let mut total_uncompressed_bytes = 0_u64;
         let mut total_compressed_bytes = 0_u64;
 
-        for (page_idx, page) in compressed_pages.iter().enumerate() {
-            let compressed_size = u32::try_from(page.compressed_bytes.len()).map_err(|_| {
-                OspreyError::InvalidDimension {
-                    dim: page.compressed_bytes.len(),
-                }
-            })?;
-            let uncompressed_size = u32::try_from(page.uncompressed_size).map_err(|_| {
-                OspreyError::InvalidDimension {
-                    dim: page.uncompressed_size,
-                }
-            })?;
+        if zstd_enabled {
+            for (page_idx, page) in compressed_pages.iter().enumerate() {
+                let compressed_size = u32::try_from(page.compressed_bytes.len()).map_err(|_| {
+                    OspreyError::InvalidDimension {
+                        dim: page.compressed_bytes.len(),
+                    }
+                })?;
+                let uncompressed_size = u32::try_from(page.uncompressed_size).map_err(|_| {
+                    OspreyError::InvalidDimension {
+                        dim: page.uncompressed_size,
+                    }
+                })?;
 
-            directory.push(MinipageDirectoryEntry {
-                byte_offset: cursor,
-                min_doc_id: page.min_doc_id,
-                max_doc_id: page.max_doc_id,
-                page_xxh64: page.page_xxh64,
-                compressed_size,
-                uncompressed_size,
-                cluster_id: page.cluster_id,
-                vector_count: page.vector_count,
-                flags: page.flags,
-            });
+                directory.push(MinipageDirectoryEntry {
+                    byte_offset: cursor,
+                    min_doc_id: page.min_doc_id,
+                    max_doc_id: page.max_doc_id,
+                    page_xxh64: page.page_xxh64,
+                    compressed_size,
+                    uncompressed_size,
+                    cluster_id: page.cluster_id,
+                    vector_count: page.vector_count,
+                    flags: page.flags,
+                });
 
-            let comp_u64 = u64::from(compressed_size);
-            let uncomp_u64 = u64::from(uncompressed_size);
-            total_compressed_bytes = total_compressed_bytes
-                .checked_add(comp_u64)
-                .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
-            total_uncompressed_bytes = total_uncompressed_bytes
-                .checked_add(uncomp_u64)
-                .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
-            cursor = cursor
-                .checked_add(comp_u64)
-                .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
+                let comp_u64 = u64::from(compressed_size);
+                let uncomp_u64 = u64::from(uncompressed_size);
+                total_compressed_bytes = total_compressed_bytes
+                    .checked_add(comp_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
+                total_uncompressed_bytes = total_uncompressed_bytes
+                    .checked_add(uncomp_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
+                cursor = cursor
+                    .checked_add(comp_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
+            }
+        } else {
+            for (page_idx, page) in pages.iter().enumerate() {
+                // Keep every uncompressed minipage 8-byte aligned so `&[u64]`/`&[f16]` can cast zero-copy on mmap.
+                cursor = align_up_8_u64(cursor)?;
+                let len_u32 =
+                    u32::try_from(page.bytes.len()).map_err(|_| OspreyError::InvalidDimension {
+                        dim: page.bytes.len(),
+                    })?;
+                let page_xxh64 = xxh64(&page.bytes, 0);
+                directory.push(MinipageDirectoryEntry {
+                    byte_offset: cursor,
+                    min_doc_id: page.min_doc_id,
+                    max_doc_id: page.max_doc_id,
+                    page_xxh64,
+                    compressed_size: len_u32,
+                    uncompressed_size: len_u32,
+                    cluster_id: page.cluster_id,
+                    vector_count: page.vector_count,
+                    flags: page.flags,
+                });
+
+                let len_u64 = u64::from(len_u32);
+                total_compressed_bytes = total_compressed_bytes
+                    .checked_add(len_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
+                total_uncompressed_bytes = total_uncompressed_bytes
+                    .checked_add(len_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
+                cursor = cursor
+                    .checked_add(len_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: page_idx })?;
+            }
         }
 
         let directory_offset = align_up_64_u64(cursor)?;
@@ -412,9 +524,21 @@ impl OsvWriter {
             write_zero_padding(writer, slabs_offset - dict_end)?;
         }
 
-        // 3. Write compressed minipage frames + 64B zero padding before directory.
-        for page in &compressed_pages {
-            writer.write_all(&page.compressed_bytes)?;
+        // 3. Write minipage frames + 64B zero padding before directory.
+        if zstd_enabled {
+            for page in &compressed_pages {
+                writer.write_all(&page.compressed_bytes)?;
+            }
+        } else {
+            let mut written_cursor = slabs_offset;
+            for page in &pages {
+                let aligned = align_up_8_u64(written_cursor)?;
+                if aligned > written_cursor {
+                    write_zero_padding(writer, aligned - written_cursor)?;
+                }
+                writer.write_all(&page.bytes)?;
+                written_cursor = aligned + u64::try_from(page.bytes.len()).unwrap_or(0);
+            }
         }
         write_zero_padding(writer, directory_offset - cursor)?;
 
@@ -547,55 +671,108 @@ impl<W: Write + Seek> StreamingOsvWriter<W> {
             self.config.minipage_target_bytes,
             permutation,
         )?;
-        let compressed_pages =
-            compress_minipages_parallel(&pages, self.config.zstd_level, &self.zstd_dict)?;
+        let zstd_enabled = self.config.zstd_level != 0;
 
-        let mut locations = Vec::with_capacity(records.len());
-        for page in compressed_pages {
-            let compressed_size = u32::try_from(page.compressed_bytes.len()).map_err(|_| {
-                OspreyError::InvalidDimension {
-                    dim: page.compressed_bytes.len(),
-                }
-            })?;
-            let uncompressed_size = u32::try_from(page.uncompressed_size).map_err(|_| {
-                OspreyError::InvalidDimension {
-                    dim: page.uncompressed_size,
-                }
-            })?;
+        if zstd_enabled {
+            let compressed_pages =
+                compress_minipages_parallel(&pages, self.config.zstd_level, &self.zstd_dict)?;
 
-            let minipage_id =
-                u32::try_from(self.directory.len()).map_err(|_| OspreyError::InvalidDimension {
-                    dim: self.directory.len(),
+            for page in compressed_pages {
+                let compressed_size = u32::try_from(page.compressed_bytes.len()).map_err(|_| {
+                    OspreyError::InvalidDimension {
+                        dim: page.compressed_bytes.len(),
+                    }
+                })?;
+                let uncompressed_size = u32::try_from(page.uncompressed_size).map_err(|_| {
+                    OspreyError::InvalidDimension {
+                        dim: page.uncompressed_size,
+                    }
                 })?;
 
-            self.directory.push(MinipageDirectoryEntry {
-                byte_offset: self.cursor,
-                min_doc_id: page.min_doc_id,
-                max_doc_id: page.max_doc_id,
-                page_xxh64: page.page_xxh64,
-                compressed_size,
-                uncompressed_size,
-                cluster_id: page.cluster_id,
-                vector_count: page.vector_count,
-                flags: page.flags,
-            });
+                let minipage_id = u32::try_from(self.directory.len()).map_err(|_| {
+                    OspreyError::InvalidDimension {
+                        dim: self.directory.len(),
+                    }
+                })?;
 
-            self.writer.write_all(&page.compressed_bytes)?;
+                self.directory.push(MinipageDirectoryEntry {
+                    byte_offset: self.cursor,
+                    min_doc_id: page.min_doc_id,
+                    max_doc_id: page.max_doc_id,
+                    page_xxh64: page.page_xxh64,
+                    compressed_size,
+                    uncompressed_size,
+                    cluster_id: page.cluster_id,
+                    vector_count: page.vector_count,
+                    flags: page.flags,
+                });
 
-            let dim_err = usize::try_from(minipage_id).unwrap_or(usize::MAX);
-            self.total_compressed_bytes = self
-                .total_compressed_bytes
-                .checked_add(u64::from(compressed_size))
-                .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
-            self.total_uncompressed_bytes = self
-                .total_uncompressed_bytes
-                .checked_add(u64::from(uncompressed_size))
-                .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
-            self.cursor = self
-                .cursor
-                .checked_add(u64::from(compressed_size))
-                .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
+                self.writer.write_all(&page.compressed_bytes)?;
+
+                let dim_err = usize::try_from(minipage_id).unwrap_or(usize::MAX);
+                self.total_compressed_bytes = self
+                    .total_compressed_bytes
+                    .checked_add(u64::from(compressed_size))
+                    .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
+                self.total_uncompressed_bytes = self
+                    .total_uncompressed_bytes
+                    .checked_add(u64::from(uncompressed_size))
+                    .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
+                self.cursor = self
+                    .cursor
+                    .checked_add(u64::from(compressed_size))
+                    .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
+            }
+        } else {
+            for page in &pages {
+                let aligned = align_up_8_u64(self.cursor)?;
+                if aligned > self.cursor {
+                    write_zero_padding(&mut self.writer, aligned - self.cursor)?;
+                    self.cursor = aligned;
+                }
+                let len_u32 =
+                    u32::try_from(page.bytes.len()).map_err(|_| OspreyError::InvalidDimension {
+                        dim: page.bytes.len(),
+                    })?;
+                let minipage_id = u32::try_from(self.directory.len()).map_err(|_| {
+                    OspreyError::InvalidDimension {
+                        dim: self.directory.len(),
+                    }
+                })?;
+                let page_xxh64 = xxh64(&page.bytes, 0);
+
+                self.directory.push(MinipageDirectoryEntry {
+                    byte_offset: self.cursor,
+                    min_doc_id: page.min_doc_id,
+                    max_doc_id: page.max_doc_id,
+                    page_xxh64,
+                    compressed_size: len_u32,
+                    uncompressed_size: len_u32,
+                    cluster_id: page.cluster_id,
+                    vector_count: page.vector_count,
+                    flags: page.flags,
+                });
+
+                self.writer.write_all(&page.bytes)?;
+
+                let dim_err = usize::try_from(minipage_id).unwrap_or(usize::MAX);
+                let len_u64 = u64::from(len_u32);
+                self.total_compressed_bytes = self
+                    .total_compressed_bytes
+                    .checked_add(len_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
+                self.total_uncompressed_bytes = self
+                    .total_uncompressed_bytes
+                    .checked_add(len_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
+                self.cursor = self
+                    .cursor
+                    .checked_add(len_u64)
+                    .ok_or(OspreyError::InvalidDimension { dim: dim_err })?;
+            }
         }
+
+        let mut locations = Vec::with_capacity(records.len());
 
         // Recover exact per-doc locations from the uncompressed pages (slot order == doc order).
         // Pages are appended in the same order `build_minipages` returns them, so the global
@@ -640,7 +817,11 @@ impl<W: Write + Seek> StreamingOsvWriter<W> {
 
         let zstd_level_i8 = i8::try_from(self.config.zstd_level)
             .map_err(|_| OspreyError::InvalidDimension { dim: 0 })?;
-        let mut flags = OSV_FLAG_ZSTD_ENABLED;
+        let mut flags = if self.config.zstd_level != 0 {
+            OSV_FLAG_ZSTD_ENABLED
+        } else {
+            0
+        };
         let (zstd_dict_offset, zstd_dict_len) = if self.zstd_dict.is_empty() {
             (0_u64, 0_u64)
         } else {
@@ -912,6 +1093,12 @@ impl<'a> OsvSlabView<'a> {
         const MAX_MINIPAGE_UNCOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
         if uncomp_len > MAX_MINIPAGE_UNCOMPRESSED_BYTES {
             return Err(OspreyError::CorruptedFooter);
+        }
+        if (self.header.flags & OSV_FLAG_ZSTD_ENABLED) == 0 {
+            if compressed.len() != uncomp_len {
+                return Err(OspreyError::CorruptedFooter);
+            }
+            return Ok(compressed.to_vec());
         }
         if let Ok(Some(frame_content_size)) = zstd::zstd_safe::get_frame_content_size(compressed) {
             if frame_content_size != u64::from(entry.uncompressed_size) {
@@ -1324,6 +1511,30 @@ impl OsvSlabReader {
                 actual: slab_bytes.len(),
             })?;
 
+        if (self.header.flags & OSV_FLAG_ZSTD_ENABLED) == 0 {
+            let computed = xxh64(compressed, 0);
+            if computed != entry.page_xxh64 {
+                return Err(OspreyError::ChecksumMismatch {
+                    expected: entry.page_xxh64,
+                    computed,
+                });
+            }
+            let uncomp_len = usize::try_from(entry.uncompressed_size)
+                .map_err(|_| OspreyError::CorruptedFooter)?;
+            if compressed.len() != uncomp_len {
+                return Err(OspreyError::CorruptedFooter);
+            }
+            let aligned = AlignedBuffer::<u8>::from_slice(compressed)?;
+            let decoded = DecodedMinipage::from_aligned_buffer(aligned)?;
+            if decoded.cluster_id() != entry.cluster_id
+                || decoded.vector_count() != entry.vector_count
+                || decoded.orig_dim() != self.header.orig_dim
+            {
+                return Err(OspreyError::CorruptedFooter);
+            }
+            return Ok(decoded);
+        }
+
         let mut decompressor = match &self.decoder_dict {
             Some(dict) => zstd::bulk::Decompressor::with_prepared_dictionary(dict)?,
             None => zstd::bulk::Decompressor::new()?,
@@ -1384,27 +1595,7 @@ pub(crate) fn verify_and_decompress_minipage_with(
 
 #[inline]
 fn exact_f16_f32_dot(vec_f16: &[f16], query_f32: &[f32]) -> f32 {
-    let n = vec_f16.len().min(query_f32.len());
-    let mut acc0 = 0.0_f32;
-    let mut acc1 = 0.0_f32;
-    let mut acc2 = 0.0_f32;
-    let mut acc3 = 0.0_f32;
-    let mut i = 0usize;
-
-    while i + 4 <= n {
-        acc0 += vec_f16[i].to_f32() * query_f32[i];
-        acc1 += vec_f16[i + 1].to_f32() * query_f32[i + 1];
-        acc2 += vec_f16[i + 2].to_f32() * query_f32[i + 2];
-        acc3 += vec_f16[i + 3].to_f32() * query_f32[i + 3];
-        i += 4;
-    }
-
-    let mut sum = (acc0 + acc1) + (acc2 + acc3);
-    while i < n {
-        sum += vec_f16[i].to_f32() * query_f32[i];
-        i += 1;
-    }
-    sum
+    osprey_simd::dot_f32_f16(query_f32, vec_f16)
 }
 
 struct CompressedMinipage {
@@ -1548,6 +1739,21 @@ fn compress_minipages_parallel(
             },
         )
         .collect()
+}
+
+#[inline]
+fn align_up_8_u64(offset: u64) -> OspreyResult<u64> {
+    let rem = offset % 8;
+    if rem == 0 {
+        Ok(offset)
+    } else {
+        offset
+            .checked_add(8 - rem)
+            .ok_or(OspreyError::AllocationFailed {
+                size: usize::MAX,
+                align: 8,
+            })
+    }
 }
 
 #[inline]
@@ -1934,6 +2140,63 @@ mod tests {
         ));
         assert_eq!(decoded.compute_exact_f16_dot(3, &query), 0.0);
         assert_eq!(decoded.compute_exact_f16_dot(0, &[1.0]), 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn osv_uncompressed_mode_roundtrip_and_8byte_alignment() -> OspreyResult<()> {
+        let dim = 17usize; // odd dim to exercise 8-byte padding between minipages
+        let vecs: Vec<Vec<f16>> = (0..30).map(|i| make_f16_vec(i, dim)).collect();
+        let payloads: Vec<Vec<u8>> = (0..30)
+            .map(|i| format!(r#"{{"doc":{i}}}"#).into_bytes())
+            .collect();
+        let records: Vec<OsvVectorRecord<'_>> = (0..30)
+            .map(|i| OsvVectorRecord {
+                doc_id: 1000 + i as u64,
+                cluster_id: u32::try_from(i % 5).unwrap_or(0),
+                vector_f16: &vecs[i],
+                payload: &payloads[i],
+            })
+            .collect();
+
+        let (bytes, report) = OsvWriter::new(OsvWriterConfig::uncompressed())
+            .write_slab_to_bytes(&records, dim, None)?;
+        assert_eq!(report.header.flags & OSV_FLAG_ZSTD_ENABLED, 0);
+        assert_eq!(report.header.zstd_level, 0);
+        assert_eq!(report.zstd_dict_bytes, 0);
+        for entry in &report.directory {
+            assert_eq!(entry.byte_offset % 8, 0);
+            assert_eq!(entry.compressed_size, entry.uncompressed_size);
+        }
+
+        let aligned = AlignedBuffer::from_slice(&bytes)?;
+        let reader = OsvSlabReader::from_bytes(aligned)?;
+        for (page_id, _) in reader.directory().iter().enumerate() {
+            let decoded = reader.decompress_minipage(u32::try_from(page_id).unwrap_or(0))?;
+            assert_eq!(decoded.orig_dim(), 17);
+        }
+
+        // Also verify StreamingOsvWriter in uncompressed mode
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut streaming = StreamingOsvWriter::new(
+            &mut cursor,
+            OsvWriterConfig::uncompressed(),
+            dim,
+            Vec::new(),
+        )?;
+        let locs1 = streaming.write_chunk(&records[..15], None)?;
+        let locs2 = streaming.write_chunk(&records[15..], None)?;
+        assert_eq!(locs1.len() + locs2.len(), 30);
+        let stream_report = streaming.finish()?;
+        assert_eq!(stream_report.header.flags & OSV_FLAG_ZSTD_ENABLED, 0);
+        for entry in &stream_report.directory {
+            assert_eq!(entry.byte_offset % 8, 0);
+        }
+        let stream_aligned = AlignedBuffer::from_slice(&cursor.into_inner())?;
+        let stream_view = OsvSlabView::from_bytes(&stream_aligned)?;
+        let page0 = stream_view.read_minipage(0)?;
+        let mp = parse_minipage(&page0)?;
+        assert!(mp.vector_f16_slice(0).is_some());
         Ok(())
     }
 }

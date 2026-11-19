@@ -29,11 +29,27 @@ impl SimdLevel {
 }
 
 static DETECTED_SIMD_LEVEL: OnceLock<SimdLevel> = OnceLock::new();
+static DETECTED_F16C: OnceLock<bool> = OnceLock::new();
 
 /// Detects and caches the highest supported SIMD tier on the host CPU.
 #[inline]
 pub fn detect_best_simd_level() -> SimdLevel {
     *DETECTED_SIMD_LEVEL.get_or_init(detect_uncached)
+}
+
+/// Returns `true` if hardware F16C (`vcvtph2ps`) instructions are available on this host.
+#[inline]
+pub fn is_f16c_supported() -> bool {
+    *DETECTED_F16C.get_or_init(|| {
+        #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            std::arch::is_x86_feature_detected!("f16c")
+        }
+        #[cfg(not(all(not(miri), any(target_arch = "x86", target_arch = "x86_64"))))]
+        {
+            false
+        }
+    })
 }
 
 /// Returns the active SIMD backend identifier detected on the host CPU:

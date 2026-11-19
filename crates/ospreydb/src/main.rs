@@ -18,8 +18,8 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use osprey_cli::cli::{
-    BenchArgs, CompletionsArgs, DeleteArgs, DoctorArgs, ImportArgs, InspectArgs, RerankArgs,
-    SearchArgs,
+    BenchArgs, CompletionsArgs, DeleteArgs, DoctorArgs, ImportArgs, InspectArgs,
+    OsvCompressionMode, RerankArgs, SearchArgs,
 };
 use osprey_cli::commands;
 use osprey_cli::output::{self, CliContext, CliError, CliResult};
@@ -27,8 +27,7 @@ use osprey_core::math::padded_dimension;
 use osprey_core::RawVectorRecord;
 use osprey_simd::{active_simd_backend, detect_best_simd_level, SimdLevel};
 use osprey_storage::{
-    build_object_store, MinipageLruCache, RangePlannerConfig, RemoteStoreConfig,
-    DEFAULT_MINIPAGE_CACHE_BYTES,
+    build_object_store, MinipageLruCache, OsvWriterConfig, RangePlannerConfig, RemoteStoreConfig,
 };
 use ospreydb::{
     serve_arrow_flight, serve_http, CompactorConfig, CowSlabCompactor, Embedder, EmbedderConfig,
@@ -144,6 +143,14 @@ struct ServeArgs {
 
     #[arg(long, default_value_t = ospreydb::DEFAULT_DELTA_FLUSH_THRESHOLD)]
     delta_flush_threshold: usize,
+
+    /// Maximum in-memory minipage LRU cache capacity in MiB (`0` disables caching).
+    #[arg(long, default_value_t = 256, env = "OSPREY_CACHE_MB")]
+    cache_mb: usize,
+
+    /// `.osv` slab compression mode for compacted segments (`auto` = `none` on `file://`, `zstd` on S3/cloud).
+    #[arg(long, value_enum, default_value_t = OsvCompressionMode::Auto, env = "OSPREY_OSV_COMPRESSION")]
+    osv_compression: OsvCompressionMode,
 
     // -- Embedder configuration (OpenAI-compatible /v1/embeddings) --
     #[arg(long, visible_alias = "embeddings-url", env = "OSPREY_EMBED_URL")]
@@ -279,46 +286,67 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
         (Some(wal), delta)
     };
 
-    let (store, manifest_key): (Arc<dyn ObjectStore>, String) = match &args.object_store_uri {
-        Some(uri) if uri.starts_with("file://") => {
-            let local_path = uri.strip_prefix("file://").unwrap_or(uri.as_str());
-            std::fs::create_dir_all(local_path)?;
-            (
-                Arc::new(LocalFileSystem::new_with_prefix(local_path)?),
-                DEFAULT_MANIFEST_KEY.to_owned(),
-            )
-        }
-        Some(uri) => {
-            let (s, path) = build_object_store(uri, &RemoteStoreConfig::default())?;
-            let path_str = path.to_string();
-            let key = if path_str.is_empty() {
-                DEFAULT_MANIFEST_KEY.to_owned()
-            } else if path_str.ends_with(".json") {
-                path_str
-            } else {
-                format!(
-                    "{}/{}",
-                    path_str.trim_end_matches('/'),
-                    DEFAULT_MANIFEST_KEY
+    let (store, manifest_key, local_store_root): (Arc<dyn ObjectStore>, String, Option<PathBuf>) =
+        match &args.object_store_uri {
+            Some(uri) if uri.starts_with("file://") => {
+                let local_path = uri.strip_prefix("file://").unwrap_or(uri.as_str());
+                std::fs::create_dir_all(local_path)?;
+                (
+                    Arc::new(LocalFileSystem::new_with_prefix(local_path)?),
+                    DEFAULT_MANIFEST_KEY.to_owned(),
+                    Some(PathBuf::from(local_path)),
                 )
-            };
-            (s, key)
-        }
-        None => (Arc::new(InMemory::new()), DEFAULT_MANIFEST_KEY.to_owned()),
-    };
+            }
+            Some(uri) => {
+                let (s, path) = build_object_store(uri, &RemoteStoreConfig::default())?;
+                let path_str = path.to_string();
+                let key = if path_str.is_empty() {
+                    DEFAULT_MANIFEST_KEY.to_owned()
+                } else if path_str.ends_with(".json") {
+                    path_str
+                } else {
+                    format!(
+                        "{}/{}",
+                        path_str.trim_end_matches('/'),
+                        DEFAULT_MANIFEST_KEY
+                    )
+                };
+                (s, key, None)
+            }
+            None => (
+                Arc::new(InMemory::new()),
+                DEFAULT_MANIFEST_KEY.to_owned(),
+                None,
+            ),
+        };
 
     let manifest_store = ManifestStore::new(Arc::clone(&store), manifest_key);
     let metrics = Arc::new(ProMetricsRegistry::new());
-    let engine = Arc::new(HybridSearchEngine::with_metrics(
+    let mut engine = HybridSearchEngine::with_metrics(
         Arc::clone(&delta),
         Arc::clone(&store),
         manifest_store.clone(),
-        Arc::new(MinipageLruCache::new(DEFAULT_MINIPAGE_CACHE_BYTES)),
+        Arc::new(MinipageLruCache::from_mb(args.cache_mb)),
         RemoteStoreConfig::default(),
         RangePlannerConfig::default(),
         Arc::clone(&metrics),
-    ));
+    );
+    if let Some(ref local_root) = local_store_root {
+        engine = engine.with_local_store_root(local_root);
+    }
+    let engine = Arc::new(engine);
     let _ = engine.refresh_from_manifest().await?;
+
+    let use_zstd = match args.osv_compression {
+        OsvCompressionMode::Auto => local_store_root.is_none() && args.object_store_uri.is_some(),
+        OsvCompressionMode::None => false,
+        OsvCompressionMode::Zstd => true,
+    };
+    let osv_writer_config = if use_zstd {
+        OsvWriterConfig::default()
+    } else {
+        OsvWriterConfig::uncompressed()
+    };
 
     let compactor_handle = if matches!(args.role, NodeRole::Unified | NodeRole::Writer) {
         let compactor = CowSlabCompactor::new(
@@ -326,6 +354,7 @@ async fn run_serve(args: ServeArgs) -> ProResult<()> {
                 delta_flush_threshold: args.delta_flush_threshold,
                 fwht_seed: args.fwht_seed,
                 poll_interval: Duration::from_secs(2),
+                osv_writer_config,
                 ..CompactorConfig::default()
             },
             Arc::clone(&store),

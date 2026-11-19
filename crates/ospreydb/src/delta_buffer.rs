@@ -3,25 +3,29 @@
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use half::f16;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use osprey_core::format::osv::OSV_FLAG_ZSTD_ENABLED;
 use osprey_core::math::{padded_dimension, prepare_and_pad_vector, RademacherSigns};
 use osprey_core::{
     cast_minipage_directory, encode_prerotated_rabitq_residual_in_place, AlignedBuffer,
-    CompactionReport, DeltaBufferExt, MinipageDirectoryEntry, OsiIndex, OspreyError, OsvHeader,
-    RabitqEntryHeader, RawVectorRecord, Stage1Candidate, TransposedQuery4Bit,
+    CompactionReport, DeltaBufferExt, MinipageDirectoryEntry, OsiHeader, OsiIndex, OsiMappedIndex,
+    OspreyError, OsvHeader, RabitqEntryHeader, RawVectorRecord, ScoredCandidate, Stage1Candidate,
+    TransposedQuery4Bit,
 };
 use osprey_simd::{SimdBackend, SimdEngine};
 use osprey_storage::{
-    CandidatePageRef, MinipageLruCache, RangePlannerConfig, RefineStage, RefinedSearchResult,
-    RemoteStoreConfig,
+    CandidatePageRef, MinipageLruCache, OsvSlabReader, RangePlannerConfig, RefineStage,
+    RefinedSearchResult, RemoteStoreConfig,
 };
 use rayon::prelude::*;
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::error::{ProEngineError, ProResult};
 use crate::manifest::{ClusterManifest, ManifestStore};
@@ -49,7 +53,7 @@ struct DeltaBufferState {
     codes: Vec<u64>,
     superseded: Vec<bool>,
     doc_index: HashMap<u64, usize>,
-    masked_in_base: RoaringTreemap,
+    masked_in_base: Arc<RoaringTreemap>,
     deleted_docs: RoaringTreemap,
     deleted_seq: HashMap<u64, u64>,
     live_count: usize,
@@ -88,6 +92,8 @@ pub struct LsmDeltaBuffer {
     num_clusters: usize,
     simd: SimdEngine,
     wal: Option<Arc<OspreyWal>>,
+    live_count_atomic: AtomicUsize,
+    has_masked_atomic: AtomicBool,
     state: RwLock<DeltaBufferState>,
 }
 
@@ -146,6 +152,8 @@ impl LsmDeltaBuffer {
             num_clusters,
             simd: SimdEngine::new_auto(),
             wal,
+            live_count_atomic: AtomicUsize::new(0),
+            has_masked_atomic: AtomicBool::new(false),
             state: RwLock::new(DeltaBufferState {
                 next_seq_no: 1,
                 ..DeltaBufferState::default()
@@ -193,9 +201,19 @@ impl LsmDeltaBuffer {
         Ok(guard.live_count)
     }
 
+    /// Lock-free fast check returning `true` when the delta buffer has zero live entries.
+    #[inline]
+    #[must_use]
+    pub fn is_empty_fast(&self) -> bool {
+        self.live_count_atomic.load(Ordering::Acquire) == 0
+    }
+
     /// Returns `true` if `doc_id` has been updated or deleted in this delta buffer, meaning
     /// any older copy in base `.osi`/`.osv` segments must be suppressed.
     pub fn is_masked_in_base(&self, doc_id: u64) -> bool {
+        if !self.has_masked_atomic.load(Ordering::Acquire) {
+            return false;
+        }
         let Ok(guard) = self.state.read() else {
             return false;
         };
@@ -204,11 +222,30 @@ impl LsmDeltaBuffer {
 
     /// Returns a cloned snapshot of all `doc_id`s tombstoned or superseded by this delta buffer.
     pub fn masked_tombstones(&self) -> ProResult<RoaringTreemap> {
+        if !self.has_masked_atomic.load(Ordering::Acquire) {
+            return Ok(RoaringTreemap::new());
+        }
         let guard = self
             .state
             .read()
             .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
-        Ok(guard.masked_in_base.clone())
+        Ok((*guard.masked_in_base).clone())
+    }
+
+    /// Zero-copy `Arc` snapshot of masked base `doc_id`s, returning `Ok(None)` lock-free when empty.
+    pub fn masked_tombstones_if_nonempty(&self) -> ProResult<Option<Arc<RoaringTreemap>>> {
+        if !self.has_masked_atomic.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
+        if guard.masked_in_base.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Arc::clone(&guard.masked_in_base)))
+        }
     }
 
     /// Replays persisted [`WalRecord`]s into memory on startup without re-writing the WAL.
@@ -385,7 +422,7 @@ impl LsmDeltaBuffer {
                     guard.live_count = guard.live_count.saturating_sub(1);
                 }
             }
-            guard.masked_in_base.insert(doc_id);
+            Arc::make_mut(&mut guard.masked_in_base).insert(doc_id);
             guard.deleted_docs.remove(doc_id);
             guard.deleted_seq.remove(&doc_id);
             guard.entries.push(entry);
@@ -395,6 +432,10 @@ impl LsmDeltaBuffer {
         }
 
         guard.next_seq_no = seq;
+        self.live_count_atomic
+            .store(guard.live_count, Ordering::Release);
+        self.has_masked_atomic
+            .store(!guard.masked_in_base.is_empty(), Ordering::Release);
         Ok(seq.saturating_sub(1))
     }
 
@@ -404,26 +445,32 @@ impl LsmDeltaBuffer {
             .write()
             .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
 
-        let mut seq = guard.next_seq_no;
+        let state = &mut *guard;
+        let mut seq = state.next_seq_no;
         if let Some(end_seq) = wal_seq_end {
             let count_u64 = u64::try_from(doc_ids.len()).unwrap_or(0);
             seq = end_seq.saturating_sub(count_u64.saturating_sub(1)).max(1);
         }
 
+        let masked = Arc::make_mut(&mut state.masked_in_base);
         for &doc_id in doc_ids {
             let cur_seq = seq;
             seq = seq.saturating_add(1);
-            guard.masked_in_base.insert(doc_id);
-            guard.deleted_docs.insert(doc_id);
-            guard.deleted_seq.insert(doc_id, cur_seq);
-            if let Some(slot) = guard.doc_index.remove(&doc_id) {
-                if !guard.superseded[slot] {
-                    guard.superseded[slot] = true;
-                    guard.live_count = guard.live_count.saturating_sub(1);
+            masked.insert(doc_id);
+            state.deleted_docs.insert(doc_id);
+            state.deleted_seq.insert(doc_id, cur_seq);
+            if let Some(slot) = state.doc_index.remove(&doc_id) {
+                if !state.superseded[slot] {
+                    state.superseded[slot] = true;
+                    state.live_count = state.live_count.saturating_sub(1);
                 }
             }
         }
-        guard.next_seq_no = seq;
+        state.next_seq_no = seq;
+        self.live_count_atomic
+            .store(state.live_count, Ordering::Release);
+        self.has_masked_atomic
+            .store(!state.masked_in_base.is_empty(), Ordering::Release);
         Ok(seq.saturating_sub(1))
     }
 
@@ -439,22 +486,10 @@ impl LsmDeltaBuffer {
                 actual: q_rot.len(),
             });
         }
-        if top_k == 0 {
+        if top_k == 0 || self.is_empty_fast() {
             return Ok(Vec::new());
         }
 
-        let transposed = TransposedQuery4Bit::try_from_rotated_query(q_rot)?;
-        let mut centroid_dots = vec![0.0_f32; self.num_clusters];
-        for (k, dot_out) in centroid_dots.iter_mut().enumerate() {
-            let c_slice = &self.centroids_f16[k * self.padded_dim..(k + 1) * self.padded_dim];
-            let mut dot = 0.0_f32;
-            for (&q, &c) in q_rot.iter().zip(c_slice.iter()) {
-                dot += q * c.to_f32();
-            }
-            *dot_out = dot;
-        }
-
-        let padded_dim_u16 = u16::try_from(self.padded_dim).unwrap_or(u16::MAX);
         let guard = self
             .state
             .read()
@@ -463,6 +498,15 @@ impl LsmDeltaBuffer {
         if guard.live_count == 0 {
             return Ok(Vec::new());
         }
+
+        let transposed = TransposedQuery4Bit::try_from_rotated_query(q_rot)?;
+        let mut centroid_dots = vec![0.0_f32; self.num_clusters];
+        for (k, dot_out) in centroid_dots.iter_mut().enumerate() {
+            let c_slice = &self.centroids_f16[k * self.padded_dim..(k + 1) * self.padded_dim];
+            *dot_out = osprey_simd::dot_f32_f16(q_rot, c_slice);
+        }
+
+        let padded_dim_u16 = u16::try_from(self.padded_dim).unwrap_or(u16::MAX);
 
         let mut candidates = Vec::with_capacity(guard.live_count);
         for (idx, entry) in guard.entries.iter().enumerate() {
@@ -533,7 +577,16 @@ impl LsmDeltaBuffer {
                 return Err(OspreyError::NonFiniteEmbedding { index }.into());
             }
         }
-        if top_k == 0 {
+        if top_k == 0 || self.is_empty_fast() {
+            return Ok(Vec::new());
+        }
+
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
+
+        if guard.live_count == 0 {
             return Ok(Vec::new());
         }
 
@@ -546,22 +599,9 @@ impl LsmDeltaBuffer {
         let mut centroid_dots = vec![0.0_f32; self.num_clusters];
         for (k, dot_out) in centroid_dots.iter_mut().enumerate() {
             let c_slice = &self.centroids_f16[k * self.padded_dim..(k + 1) * self.padded_dim];
-            let mut dot = 0.0_f32;
-            for (&q, &c) in q_rot.iter().zip(c_slice.iter()) {
-                dot += q * c.to_f32();
-            }
-            *dot_out = dot;
+            *dot_out = osprey_simd::dot_f32_f16(&q_rot, c_slice);
         }
         let padded_dim_u16 = u16::try_from(self.padded_dim).unwrap_or(u16::MAX);
-
-        let guard = self
-            .state
-            .read()
-            .map_err(|_| ProEngineError::Io(std::io::Error::other("delta RwLock poisoned")))?;
-
-        if guard.live_count == 0 {
-            return Ok(Vec::new());
-        }
 
         // For large delta buffers (> 256 live items), use 1-bit RaBitQ overfetch shortlist first;
         // for small deltas, refine every live entry directly for 100% recall.
@@ -724,10 +764,14 @@ impl LsmDeltaBuffer {
         guard.codes = remaining_codes;
         guard.superseded = remaining_superseded;
         guard.doc_index = remaining_doc_index;
-        guard.masked_in_base = remaining_masked;
+        guard.masked_in_base = Arc::new(remaining_masked);
         guard.deleted_docs = remaining_deleted;
         guard.deleted_seq = remaining_deleted_seq;
         guard.live_count = remaining_live;
+        self.live_count_atomic
+            .store(guard.live_count, Ordering::Release);
+        self.has_masked_atomic
+            .store(!guard.masked_in_base.is_empty(), Ordering::Release);
         Ok(())
     }
 
@@ -770,6 +814,75 @@ impl DeltaBufferExt for LsmDeltaBuffer {
     }
 }
 
+/// Resident `.osi` index representation supporting zero-copy `memmap2` or owned buffers.
+#[derive(Debug)]
+pub enum SegmentOsi {
+    /// Zero-copy `Mmap` or single-copy `AlignedBuffer`-backed `.osi` index.
+    Mapped(OsiMappedIndex),
+    /// Owned heap-resident `.osi` index.
+    Owned(OsiIndex),
+}
+
+impl SegmentOsi {
+    /// Returns the validated `.osi` header.
+    #[inline]
+    #[must_use]
+    pub fn header(&self) -> &OsiHeader {
+        match self {
+            Self::Mapped(m) => m.header(),
+            Self::Owned(o) => o.header(),
+        }
+    }
+
+    /// Returns the `.osi` tombstone bitmap.
+    #[inline]
+    #[must_use]
+    pub fn tombstones(&self) -> &RoaringBitmap {
+        match self {
+            Self::Mapped(m) => m.tombstones(),
+            Self::Owned(o) => o.tombstones(),
+        }
+    }
+
+    /// Executes unfiltered Stage-1 asymmetric `RaBitQ` search.
+    #[inline]
+    pub fn search_candidates(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        top_m: usize,
+        simd: &SimdEngine,
+    ) -> osprey_core::OspreyResult<Vec<ScoredCandidate>> {
+        match self {
+            Self::Mapped(m) => m.search_candidates(query, nprobe, top_m, simd),
+            Self::Owned(o) => o.search_candidates(query, nprobe, top_m, simd),
+        }
+    }
+
+    /// Executes Stage-1 asymmetric `RaBitQ` search with a caller-supplied predicate.
+    #[inline]
+    pub fn search_candidates_filtered_with<F>(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        top_m: usize,
+        simd: &SimdEngine,
+        allow_entry: F,
+    ) -> osprey_core::OspreyResult<Vec<ScoredCandidate>>
+    where
+        F: Fn(u32, u64) -> bool,
+    {
+        match self {
+            Self::Mapped(m) => {
+                m.search_candidates_filtered_with(query, nprobe, top_m, simd, allow_entry)
+            }
+            Self::Owned(o) => {
+                o.search_candidates_filtered_with(query, nprobe, top_m, simd, allow_entry)
+            }
+        }
+    }
+}
+
 /// Loaded immutable segment cached by a stateless reader node.
 #[derive(Debug)]
 pub struct LoadedSegment {
@@ -777,14 +890,28 @@ pub struct LoadedSegment {
     pub segment_id: u64,
     /// Object store path of the `.osv` slab.
     pub osv_path: ObjectPath,
-    /// Parsed resident `.osi` 1-bit index.
-    pub osi: Arc<OsiIndex>,
+    /// Parsed resident `.osi` 1-bit index (zero-copy `mmap` on `file://`).
+    pub osi: Arc<SegmentOsi>,
     /// `.osv` minipage directory entries.
     pub osv_directory: Vec<MinipageDirectoryEntry>,
     /// `RefineStage` configured with `slab_id`, `RangePlannerConfig`, and optional Zstd dict.
     pub refine_stage: RefineStage,
     /// Segment-local tombstones from `manifest.json`.
     pub tombstones: RoaringTreemap,
+}
+
+/// Executes blocking CPU/mmap work safely on both `multi_thread` and `current_thread` Tokio runtimes.
+#[inline]
+fn block_in_place_safe<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(f);
+        }
+    }
+    f()
 }
 
 /// Hybrid search coordinator combining immutable S3 `.osi`/`.osv` segments with the live
@@ -797,9 +924,10 @@ pub struct HybridSearchEngine {
     cache: Arc<MinipageLruCache>,
     remote_config: RemoteStoreConfig,
     range_planner_config: RangePlannerConfig,
+    local_store_root: Option<PathBuf>,
     simd: SimdEngine,
     segments: RwLock<Vec<Arc<LoadedSegment>>>,
-    global_tombstones: RwLock<RoaringTreemap>,
+    global_tombstones: RwLock<Arc<RoaringTreemap>>,
     known_etag: RwLock<Option<String>>,
     known_epoch: RwLock<Option<u64>>,
     metrics: Arc<ProMetricsRegistry>,
@@ -845,13 +973,22 @@ impl HybridSearchEngine {
             cache,
             remote_config,
             range_planner_config,
+            local_store_root: None,
             simd: SimdEngine::new_auto(),
             segments: RwLock::new(Vec::new()),
-            global_tombstones: RwLock::new(RoaringTreemap::new()),
+            global_tombstones: RwLock::new(Arc::new(RoaringTreemap::new())),
             known_etag: RwLock::new(None),
             known_epoch: RwLock::new(None),
             metrics,
         }
+    }
+
+    /// Configures a local filesystem root directory (`file://` object store) to enable
+    /// zero-copy `mmap` for `.osi` and direct `mmap`/`pread` fast-path for `.osv`.
+    #[must_use]
+    pub fn with_local_store_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.local_store_root = Some(root.into());
+        self
     }
 
     /// Returns the Prometheus metrics registry bound to this search engine.
@@ -981,7 +1118,7 @@ impl HybridSearchEngine {
             let mut tomb_guard = self.global_tombstones.write().map_err(|_| {
                 ProEngineError::Io(std::io::Error::other("tombstone RwLock poisoned"))
             })?;
-            *tomb_guard = global_tombs;
+            *tomb_guard = Arc::new(global_tombs);
         }
         {
             let mut etag_guard = self
@@ -1008,10 +1145,56 @@ impl HybridSearchEngine {
     ) -> ProResult<LoadedSegment> {
         let osi_path = ObjectPath::from(desc.osi_key.as_str());
         let osv_path = ObjectPath::from(desc.osv_key.as_str());
+        #[allow(clippy::cast_possible_truncation)]
+        let slab_id = (desc.segment_id & 0xFFFF) as u16;
+
+        if let Some(root) = &self.local_store_root {
+            let local_osi_path = root.join(desc.osi_key.trim_start_matches('/'));
+            let local_osv_path = root.join(desc.osv_key.trim_start_matches('/'));
+            if local_osi_path.exists() && local_osv_path.exists() {
+                let osi = Arc::new(SegmentOsi::Mapped(OsiMappedIndex::open_mmap(
+                    &local_osi_path,
+                )?));
+                let reader = OsvSlabReader::open_mmap(&local_osv_path)?;
+                let osv_header = *reader.header();
+                let osv_directory = reader.directory().to_vec();
+                let zstd_dict = if osv_header.zstd_dict_len > 0 {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut f = std::fs::File::open(&local_osv_path)?;
+                    let len = usize::try_from(osv_header.zstd_dict_len)
+                        .map_err(|_| OspreyError::CorruptedFooter)?;
+                    f.seek(SeekFrom::Start(osv_header.zstd_dict_offset))?;
+                    let mut dict = vec![0_u8; len];
+                    f.read_exact(&mut dict)?;
+                    Some(dict)
+                } else {
+                    None
+                };
+                drop(reader);
+                let refine_stage = RefineStage::open_local_path(
+                    slab_id,
+                    self.range_planner_config,
+                    &osv_header,
+                    zstd_dict,
+                    &local_osv_path,
+                )?;
+                return Ok(LoadedSegment {
+                    segment_id: desc.segment_id,
+                    osv_path,
+                    osi,
+                    osv_directory,
+                    refine_stage,
+                    tombstones,
+                });
+            }
+        }
 
         let osi_bytes = self.store.get(&osi_path).await?.bytes().await?;
         let aligned_osi = AlignedBuffer::<u8>::from_slice(&osi_bytes)?;
-        let osi = Arc::new(OsiIndex::from_bytes(aligned_osi.as_slice())?);
+        drop(osi_bytes);
+        let osi = Arc::new(SegmentOsi::Mapped(OsiMappedIndex::from_aligned_buffer(
+            aligned_osi,
+        )?));
 
         let osv_meta = self.store.head(&osv_path).await?;
         let hdr_bytes = self.store.get_range(&osv_path, 0..64).await?;
@@ -1048,9 +1231,9 @@ impl HybridSearchEngine {
             None
         };
 
-        #[allow(clippy::cast_possible_truncation)]
-        let slab_id = (desc.segment_id & 0xFFFF) as u16;
-        let refine_stage = RefineStage::new(slab_id, self.range_planner_config, zstd_dict);
+        let zstd_enabled = (osv_header.flags & OSV_FLAG_ZSTD_ENABLED) != 0;
+        let refine_stage = RefineStage::new(slab_id, self.range_planner_config, zstd_dict)
+            .with_zstd_enabled(zstd_enabled);
 
         Ok(LoadedSegment {
             segment_id: desc.segment_id,
@@ -1091,42 +1274,166 @@ impl HybridSearchEngine {
             let guard = self.global_tombstones.read().map_err(|_| {
                 ProEngineError::Io(std::io::Error::other("tombstone RwLock poisoned"))
             })?;
-            guard.clone()
+            Arc::clone(&*guard)
         };
-        let delta_masked = self.delta.masked_tombstones()?;
+        let delta_masked = self.delta.masked_tombstones_if_nonempty()?;
+        let delta_is_empty = self.delta.is_empty_fast();
+        let has_global_tombs = !global_tombs.is_empty();
 
-        // Run delta exact search concurrently with Stage-1 .osi scans across segments.
+        if segments_snapshot.is_empty() {
+            if delta_is_empty {
+                return Ok(Vec::new());
+            }
+            let stage1_start = Instant::now();
+            let hits = block_in_place_safe(|| self.delta.search_exact(query_f32, top_k))?;
+            let stage1_us = u64::try_from(stage1_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.metrics.observe_rabitq_scan(stage1_us);
+            return Ok(hits);
+        }
+
+        // Fast-path: single segment + empty delta skips rayon::join / par_iter contention completely.
         let stage1_start = Instant::now();
-        let delta_ref = &self.delta;
-        let simd_ref = &self.simd;
-        let (delta_res, segment_stage1_res) = rayon::join(
-            || delta_ref.search_exact(query_f32, top_k),
-            || {
-                segments_snapshot
-                    .par_iter()
-                    .map(|seg| {
-                        let candidates = seg.osi.search_candidates_filtered_with(
-                            query_f32,
-                            nprobe,
-                            top_m_per_segment,
-                            simd_ref,
-                            |_entry_idx, doc_id| {
-                                !global_tombs.contains(doc_id)
-                                    && !seg.tombstones.contains(doc_id)
-                                    && !delta_masked.contains(doc_id)
-                                    && !seg.osi.is_deleted(doc_id)
-                            },
-                        )?;
-                        Ok::<_, ProEngineError>((Arc::clone(seg), candidates))
-                    })
-                    .collect::<ProResult<Vec<_>>>()
-            },
-        );
+        let (delta_hits, stage1_per_seg) = if segments_snapshot.len() == 1 && delta_is_empty {
+            let seg = &segments_snapshot[0];
+            let no_external_tombs =
+                !has_global_tombs && seg.tombstones.is_empty() && delta_masked.is_none();
+            let cands = block_in_place_safe(|| {
+                if no_external_tombs {
+                    seg.osi
+                        .search_candidates(query_f32, nprobe, top_m_per_segment, &self.simd)
+                } else {
+                    let dm_ref = delta_masked.as_deref();
+                    seg.osi.search_candidates_filtered_with(
+                        query_f32,
+                        nprobe,
+                        top_m_per_segment,
+                        &self.simd,
+                        |_entry_idx, doc_id| {
+                            (!has_global_tombs || !global_tombs.contains(doc_id))
+                                && (seg.tombstones.is_empty() || !seg.tombstones.contains(doc_id))
+                                && dm_ref.is_none_or(|m| !m.contains(doc_id))
+                        },
+                    )
+                }
+            })?;
+            (Vec::new(), vec![(Arc::clone(seg), cands)])
+        } else {
+            let delta_ref = &self.delta;
+            let simd_ref = &self.simd;
+            let dm_ref = delta_masked.as_deref();
+            let (delta_res, segment_stage1_res) = block_in_place_safe(|| {
+                if delta_is_empty {
+                    let seg_res = segments_snapshot
+                        .par_iter()
+                        .map(|seg| {
+                            let cands = if !has_global_tombs
+                                && seg.tombstones.is_empty()
+                                && dm_ref.is_none()
+                            {
+                                seg.osi.search_candidates(
+                                    query_f32,
+                                    nprobe,
+                                    top_m_per_segment,
+                                    simd_ref,
+                                )?
+                            } else {
+                                seg.osi.search_candidates_filtered_with(
+                                    query_f32,
+                                    nprobe,
+                                    top_m_per_segment,
+                                    simd_ref,
+                                    |_entry_idx, doc_id| {
+                                        (!has_global_tombs || !global_tombs.contains(doc_id))
+                                            && (seg.tombstones.is_empty()
+                                                || !seg.tombstones.contains(doc_id))
+                                            && dm_ref.is_none_or(|m| !m.contains(doc_id))
+                                    },
+                                )?
+                            };
+                            Ok::<_, ProEngineError>((Arc::clone(seg), cands))
+                        })
+                        .collect::<ProResult<Vec<_>>>();
+                    (Ok(Vec::new()), seg_res)
+                } else {
+                    rayon::join(
+                        || delta_ref.search_exact(query_f32, top_k),
+                        || {
+                            segments_snapshot
+                                .par_iter()
+                                .map(|seg| {
+                                    let cands = seg.osi.search_candidates_filtered_with(
+                                        query_f32,
+                                        nprobe,
+                                        top_m_per_segment,
+                                        simd_ref,
+                                        |_entry_idx, doc_id| {
+                                            (!has_global_tombs || !global_tombs.contains(doc_id))
+                                                && (seg.tombstones.is_empty()
+                                                    || !seg.tombstones.contains(doc_id))
+                                                && dm_ref.is_none_or(|m| !m.contains(doc_id))
+                                        },
+                                    )?;
+                                    Ok::<_, ProEngineError>((Arc::clone(seg), cands))
+                                })
+                                .collect::<ProResult<Vec<_>>>()
+                        },
+                    )
+                }
+            });
+            (delta_res?, segment_stage1_res?)
+        };
         let stage1_us = u64::try_from(stage1_start.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.metrics.observe_rabitq_scan(stage1_us);
 
-        let delta_hits = delta_res?;
-        let stage1_per_seg = segment_stage1_res?;
+        // Single-segment fast-path: bypass try_join_all, HashMap, and re-sort when delta is empty.
+        if stage1_per_seg.len() == 1 && delta_hits.is_empty() {
+            let (seg, cands) = stage1_per_seg.into_iter().next().ok_or_else(|| {
+                ProEngineError::Io(std::io::Error::other(
+                    "missing segment in single-segment path",
+                ))
+            })?;
+            if cands.is_empty() {
+                return Ok(Vec::new());
+            }
+            let page_refs: Vec<CandidatePageRef> =
+                cands.iter().map(CandidatePageRef::from).collect();
+            let (refined, stats) = seg
+                .refine_stage
+                .refine_async(
+                    query_f32,
+                    &page_refs,
+                    top_k,
+                    &seg.osv_directory,
+                    &self.cache,
+                    &self.store,
+                    &seg.osv_path,
+                    &self.remote_config,
+                )
+                .await?;
+            self.metrics.observe_range_plan_and_s3(
+                stats.range_plan_time_us,
+                stats.raw_page_requests,
+                stats.coalesced_range_gets,
+                stats.cache_hits,
+            );
+            self.metrics.observe_refine_breakdown(
+                stats.cache_lookup_us,
+                stats.disk_read_us,
+                stats.zstd_decode_us,
+                stats.f16_score_us,
+            );
+            if !has_global_tombs && delta_masked.is_none() {
+                return Ok(refined);
+            }
+            let dm_ref = delta_masked.as_deref();
+            return Ok(refined
+                .into_iter()
+                .filter(|hit| {
+                    (!has_global_tombs || !global_tombs.contains(hit.doc_id))
+                        && dm_ref.is_none_or(|m| !m.contains(hit.doc_id))
+                })
+                .collect());
+        }
 
         // Dispatch async Stage-3 `.osv` refinements concurrently across all segments.
         let refine_futs = stage1_per_seg.into_iter().map(|(seg, cands)| {
@@ -1159,6 +1466,12 @@ impl HybridSearchEngine {
                     stats.coalesced_range_gets,
                     stats.cache_hits,
                 );
+                metrics.observe_refine_breakdown(
+                    stats.cache_lookup_us,
+                    stats.disk_read_us,
+                    stats.zstd_decode_us,
+                    stats.f16_score_us,
+                );
                 Ok(refined)
             }
         });
@@ -1170,9 +1483,12 @@ impl HybridSearchEngine {
         for hit in delta_hits {
             by_doc.insert(hit.doc_id, hit);
         }
+        let dm_ref = delta_masked.as_deref();
         for seg_hits in base_hits_nested {
             for hit in seg_hits {
-                if delta_masked.contains(hit.doc_id) || global_tombs.contains(hit.doc_id) {
+                if (has_global_tombs && global_tombs.contains(hit.doc_id))
+                    || dm_ref.is_some_and(|m| m.contains(hit.doc_id))
+                {
                     continue;
                 }
                 by_doc.entry(hit.doc_id).or_insert(hit);
@@ -1182,8 +1498,7 @@ impl HybridSearchEngine {
         let mut merged: Vec<RefinedSearchResult> = by_doc.into_values().collect();
         merged.sort_by(|a, b| {
             b.exact_score
-                .partial_cmp(&a.exact_score)
-                .unwrap_or(CmpOrdering::Equal)
+                .total_cmp(&a.exact_score)
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         merged.truncate(top_k);
@@ -1193,25 +1508,7 @@ impl HybridSearchEngine {
 
 #[inline]
 fn exact_f16_dot(query_f32: &[f32], vec_f16: &[f16]) -> f32 {
-    let mut acc0 = 0.0_f32;
-    let mut acc1 = 0.0_f32;
-    let mut acc2 = 0.0_f32;
-    let mut acc3 = 0.0_f32;
-    let n = query_f32.len().min(vec_f16.len());
-    let mut i = 0_usize;
-    while i + 4 <= n {
-        acc0 += query_f32[i] * vec_f16[i].to_f32();
-        acc1 += query_f32[i + 1] * vec_f16[i + 1].to_f32();
-        acc2 += query_f32[i + 2] * vec_f16[i + 2].to_f32();
-        acc3 += query_f32[i + 3] * vec_f16[i + 3].to_f32();
-        i += 4;
-    }
-    let mut total = (acc0 + acc1) + (acc2 + acc3);
-    while i < n {
-        total += query_f32[i] * vec_f16[i].to_f32();
-        i += 1;
-    }
-    total
+    osprey_simd::dot_f32_f16(query_f32, vec_f16)
 }
 
 #[cfg(test)]
@@ -1360,5 +1657,86 @@ mod tests {
         let hits = delta.search_exact(&v2, 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, 2);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_local_uncompressed_single_segment_current_thread_and_metrics() {
+        use object_store::local::LocalFileSystem;
+        use osprey_storage::OsvWriterConfig;
+
+        use crate::compactor::{CompactorConfig, CowSlabCompactor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let manifest_store = ManifestStore::new(Arc::clone(&store), "manifest.json");
+        let seed = 0x4F53_5052_0001_u64;
+        let dim = 64usize;
+        let delta = Arc::new(LsmDeltaBuffer::new(dim, dim, seed, Vec::new(), None).unwrap());
+
+        let mut target = vec![0.0_f32; dim];
+        target[25] = 1.0;
+        let mut recs = Vec::new();
+        let mut storage = Vec::with_capacity(16);
+        for i in 0..16usize {
+            let mut v = vec![0.0_f32; dim];
+            if i == 7 {
+                v[25] = 1.0;
+            } else {
+                v[i % dim] = 1.0;
+                v[(i + 1) % dim] = 0.25;
+            }
+            storage.push(v);
+        }
+        for (i, v) in storage.iter().enumerate() {
+            recs.push(RawVectorRecord {
+                doc_id: (i as u64) + 100,
+                vector: v,
+                payload_json: br#"{"ok":true}"#,
+            });
+        }
+        delta.ingest_batch(&recs).unwrap();
+
+        let compactor = CowSlabCompactor::new(
+            CompactorConfig {
+                delta_flush_threshold: 1,
+                target_clusters: 4,
+                fwht_seed: seed,
+                osv_writer_config: OsvWriterConfig::uncompressed(),
+                ..CompactorConfig::default()
+            },
+            Arc::clone(&store),
+            manifest_store.clone(),
+        );
+        let cache = Arc::new(MinipageLruCache::from_mb(4));
+        let engine = HybridSearchEngine::new(
+            Arc::clone(&delta),
+            Arc::clone(&store),
+            manifest_store,
+            cache,
+            RemoteStoreConfig::default(),
+            RangePlannerConfig::default(),
+        )
+        .with_local_store_root(dir.path());
+
+        let outcome = compactor
+            .compact_now_with_engine(&delta, None, Some(&engine))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.vectors_compacted, 16);
+        assert_eq!(delta.live_count().unwrap(), 0);
+        assert!(delta.is_empty_fast());
+        assert_eq!(engine.loaded_segment_count().unwrap(), 1);
+
+        // Executes inside default tokio `current_thread` runtime without panicking in
+        // `block_in_place_safe` and uses zero-copy `.osi` + uncompressed `.osv` mmap fast-path.
+        let results = engine.search_hybrid_async(&target, 4, 8, 3).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].doc_id, 107);
+
+        let prom = engine.metrics().render_prometheus();
+        assert!(prom.contains("osprey_pro_stage1_duration_microseconds_count 1"));
+        assert!(prom.contains("osprey_pro_f16_score_duration_microseconds_count 1"));
     }
 }

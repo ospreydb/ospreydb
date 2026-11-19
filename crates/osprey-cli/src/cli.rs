@@ -72,6 +72,18 @@ pub struct DoctorArgs {
     pub bench_mb: usize,
 }
 
+/// Compression mode for `.osv` vector slabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum OsvCompressionMode {
+    /// Automatic: uncompressed (`none`) for local NVMe paths, `zstd` for remote S3/cloud URIs.
+    #[default]
+    Auto,
+    /// Uncompressed `.osv` minipages for zero-copy local `mmap` reads.
+    None,
+    /// Zstd-compressed `.osv` minipages (recommended for S3/cloud object storage).
+    Zstd,
+}
+
 /// Arguments for `osprey import`.
 #[derive(Debug, Args)]
 pub struct ImportArgs {
@@ -122,6 +134,10 @@ pub struct ImportArgs {
     /// Disable Zstd payload dictionary training on `.osv` slabs.
     #[arg(long)]
     pub no_zstd_dict: bool,
+
+    /// `.osv` slab compression mode (`auto` = `none` for local paths, `zstd` for S3/remote).
+    #[arg(long, value_enum, default_value_t = OsvCompressionMode::Auto)]
+    pub osv_compression: OsvCompressionMode,
 
     /// Deterministic SplitMix64 seed for FWHT rotation and Binary K-Means.
     #[arg(long, default_value_t = 0x4F53_5052_0001)]

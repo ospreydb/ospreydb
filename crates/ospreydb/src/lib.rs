@@ -23,7 +23,9 @@ pub use compactor::{
     TombstoneGarbageCollector, TombstoneGcConfig, TombstoneGcReport, DEFAULT_DELTA_FLUSH_THRESHOLD,
     DEFAULT_TOMBSTONE_GC_THRESHOLD,
 };
-pub use delta_buffer::{FrozenDeltaSnapshot, HybridSearchEngine, LoadedSegment, LsmDeltaBuffer};
+pub use delta_buffer::{
+    FrozenDeltaSnapshot, HybridSearchEngine, LoadedSegment, LsmDeltaBuffer, SegmentOsi,
+};
 pub use embedder::{Embedder, EmbedderConfig};
 pub use error::{ProEngineError, ProResult};
 pub use flight_server::{serve_arrow_flight, OspreyFlightService, DEFAULT_ARROW_FLIGHT_ADDR};

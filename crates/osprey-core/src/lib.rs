@@ -45,8 +45,9 @@ pub use lutrank::{
     OSR_TOKEN_BYTES,
 };
 pub use rabitq::{
-    encode_prerotated_rabitq_residual, encode_prerotated_rabitq_residual_in_place,
-    encode_rabitq_residual, encode_rabitq_residual_scalar, OsiIndex, OsiMappedView, ProbedCluster,
+    dot_f32_f16_scalar, encode_prerotated_rabitq_residual,
+    encode_prerotated_rabitq_residual_in_place, encode_rabitq_residual,
+    encode_rabitq_residual_scalar, OsiIndex, OsiMappedIndex, OsiMappedView, ProbedCluster,
     RabitqEncodedResidual, RabitqFwhtKernel, RabitqScanKernel, ScalarRabitqKernel,
     TransposedQuery4Bit, VectorLocation, OSI_FLAG_UNROTATED_CENTROIDS, QUERY_QUANT_EPS,
     RABITQ_F16_MAX_CLAMP, RABITQ_L1_MIN_NORMAL_F32, RABITQ_NORM_EPS,

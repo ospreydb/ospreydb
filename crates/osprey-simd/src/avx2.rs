@@ -1044,3 +1044,66 @@ pub unsafe fn lutrank_doc_maxsim_avx2(
 
     total_maxsim
 }
+
+/// Computes the exact `f32 x f16` inner product accumulated in `f32` using AVX2 + F16C + FMA.
+///
+/// # Safety
+/// Caller must ensure the host CPU supports `avx2`, `f16c`, and `fma`.
+#[target_feature(enable = "avx2,f16c,fma")]
+pub unsafe fn dot_f32_f16_avx2(a_f32: &[f32], b_f16: &[half::f16]) -> f32 {
+    let n = a_f32.len().min(b_f16.len());
+    let a_ptr = a_f32.as_ptr();
+    let b_ptr = b_f16.as_ptr().cast::<u16>();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n <= a_f32.len().min(b_f16.len())`.
+        unsafe {
+            let va0 = _mm256_loadu_ps(a_ptr.add(i));
+            let va1 = _mm256_loadu_ps(a_ptr.add(i + 8));
+            let va2 = _mm256_loadu_ps(a_ptr.add(i + 16));
+            let va3 = _mm256_loadu_ps(a_ptr.add(i + 24));
+
+            let vb0 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i).cast::<__m128i>()));
+            let vb1 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i + 8).cast::<__m128i>()));
+            let vb2 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i + 16).cast::<__m128i>()));
+            let vb3 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i + 24).cast::<__m128i>()));
+
+            acc0 = _mm256_fmadd_ps(va0, vb0, acc0);
+            acc1 = _mm256_fmadd_ps(va1, vb1, acc1);
+            acc2 = _mm256_fmadd_ps(va2, vb2, acc2);
+            acc3 = _mm256_fmadd_ps(va3, vb3, acc3);
+        }
+        i += 32;
+    }
+
+    while i + 8 <= n {
+        // SAFETY: `i + 8 <= n <= a_f32.len().min(b_f16.len())`.
+        unsafe {
+            let va = _mm256_loadu_ps(a_ptr.add(i));
+            let vb = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i).cast::<__m128i>()));
+            acc0 = _mm256_fmadd_ps(va, vb, acc0);
+        }
+        i += 8;
+    }
+
+    let sum_256 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let lo = _mm256_castps256_ps128(sum_256);
+    let hi = _mm256_extractf128_ps::<1>(sum_256);
+    let sum_128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum_128);
+    let sums = _mm_add_ps(sum_128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let mut sum = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+
+    while i < n {
+        sum += a_f32[i] * b_f16[i].to_f32();
+        i += 1;
+    }
+    sum
+}

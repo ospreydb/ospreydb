@@ -817,3 +817,61 @@ pub unsafe fn lutrank_doc_maxsim_avx512(
 
     total_maxsim
 }
+
+/// Computes the exact `f32 x f16` inner product accumulated in `f32` using AVX-512F + F16C + FMA.
+///
+/// # Safety
+/// Caller must ensure the host CPU supports `avx512f`, `f16c`, and `fma`.
+#[target_feature(enable = "avx512f,f16c,fma")]
+pub unsafe fn dot_f32_f16_avx512(a_f32: &[f32], b_f16: &[half::f16]) -> f32 {
+    let n = a_f32.len().min(b_f16.len());
+    let a_ptr = a_f32.as_ptr();
+    let b_ptr = b_f16.as_ptr().cast::<u16>();
+
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 64 <= n {
+        // SAFETY: `i + 64 <= n <= a_f32.len().min(b_f16.len())`.
+        unsafe {
+            let va0 = _mm512_loadu_ps(a_ptr.add(i));
+            let va1 = _mm512_loadu_ps(a_ptr.add(i + 16));
+            let va2 = _mm512_loadu_ps(a_ptr.add(i + 32));
+            let va3 = _mm512_loadu_ps(a_ptr.add(i + 48));
+
+            let vb0 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i).cast::<__m256i>()));
+            let vb1 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i + 16).cast::<__m256i>()));
+            let vb2 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i + 32).cast::<__m256i>()));
+            let vb3 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i + 48).cast::<__m256i>()));
+
+            acc0 = _mm512_fmadd_ps(va0, vb0, acc0);
+            acc1 = _mm512_fmadd_ps(va1, vb1, acc1);
+            acc2 = _mm512_fmadd_ps(va2, vb2, acc2);
+            acc3 = _mm512_fmadd_ps(va3, vb3, acc3);
+        }
+        i += 64;
+    }
+
+    while i + 16 <= n {
+        // SAFETY: `i + 16 <= n <= a_f32.len().min(b_f16.len())`.
+        unsafe {
+            let va = _mm512_loadu_ps(a_ptr.add(i));
+            let vb = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i).cast::<__m256i>()));
+            acc0 = _mm512_fmadd_ps(va, vb, acc0);
+        }
+        i += 16;
+    }
+
+    let sum01 = _mm512_add_ps(acc0, acc1);
+    let sum23 = _mm512_add_ps(acc2, acc3);
+    let mut sum = _mm512_reduce_add_ps(_mm512_add_ps(sum01, sum23));
+
+    while i < n {
+        sum += a_f32[i] * b_f16[i].to_f32();
+        i += 1;
+    }
+    sum
+}

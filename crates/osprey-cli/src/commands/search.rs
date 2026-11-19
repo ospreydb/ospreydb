@@ -2,24 +2,22 @@
 //! planning, exact `f16` refinement, optional `.osr` ColBERT `LUT-Rank` reranking over
 //! Top-200 candidates, and clean ASCII table / `--json` output.
 
-use std::fs::File;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use comfy_table::{Cell, CellAlignment};
-use memmap2::MmapOptions;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use osprey_core::{
-    cast_minipage_directory, AlignedBuffer, MinipageDirectoryEntry, OsiIndex, OsiMappedView,
-    OspreyError, OsrStore, OsvHeader, QuantizedQueryLut, ScoredCandidate, SearchOptions,
+    cast_minipage_directory, AlignedBuffer, MinipageDirectoryEntry, OsiMappedIndex, OspreyError,
+    OsrStore, OsvHeader, QuantizedQueryLut, ScoredCandidate, SearchOptions,
 };
 use osprey_simd::{active_simd_backend, SimdBackend, SimdEngine};
 use osprey_storage::{
-    build_object_store, MinipageLruCache, RangePlannerConfig, RefineStage, RefineStats,
-    RefinedSearchResult, RemoteStoreConfig,
+    build_object_store, MinipageLruCache, OsvSlabReader, RangePlannerConfig, RefineStage,
+    RefineStats, RefinedSearchResult, RemoteStoreConfig,
 };
 use serde::Serialize;
 
@@ -54,6 +52,10 @@ pub struct SearchTelemetry {
     pub coalesce_factor: f64,
     pub cache_hits: usize,
     pub bytes_fetched: u64,
+    pub cache_lookup_us: u64,
+    pub disk_read_us: u64,
+    pub zstd_decode_us: u64,
+    pub f16_score_us: u64,
     pub stage2_3_ms: f64,
     pub rerank_applied: bool,
     pub rerank_candidates: usize,
@@ -126,13 +128,7 @@ pub fn execute_search(args: &SearchArgs, ctx: &CliContext) -> CliResult<SearchRe
         "Memory-mapping .osi index '{}'...",
         args.index.display()
     ));
-    let file = File::open(&args.index)?;
-    // SAFETY: `.osi` index is read-only and checksum-validated before reading any field.
-    // `populate()` eagerly faults the ~15 MB `.osi` resident index into RAM (MAP_POPULATE),
-    // eliminating p99 tail latency caused by on-demand disk page faults during the hot scan.
-    let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
-    let _view = OsiMappedView::from_bytes(&mmap)?;
-    let osi = OsiIndex::from_bytes(&mmap)?;
+    let osi = OsiMappedIndex::open_mmap(&args.index)?;
 
     let simd = SimdEngine::new_auto();
     let do_rerank = args.rerank_store.is_some() && query_tokens.is_some();
@@ -185,26 +181,64 @@ pub fn execute_search(args: &SearchArgs, ctx: &CliContext) -> CliResult<SearchRe
         .map_err(|err| CliError::Io(format!("failed to create tokio runtime: {err}")))?;
 
     let t_s23 = Instant::now();
-    let (refined, refine_stats): (Vec<RefinedSearchResult>, RefineStats) = rt.block_on(async {
-        let (directory, zstd_dict) = load_osv_metadata_async(&store, &obj_path).await?;
-        let refine_stage = RefineStage::new(0, RangePlannerConfig::default(), zstd_dict);
-        let cache_bytes = args.cache_mb.max(1).saturating_mul(1024 * 1024);
-        let cache = MinipageLruCache::new(cache_bytes);
-
-        refine_stage
-            .refine_scored_async(
+    let (refined, refine_stats): (Vec<RefinedSearchResult>, RefineStats) = match &slabs_target {
+        LocationTarget::Local(local_osv_path) => {
+            let reader = OsvSlabReader::open_mmap(local_osv_path)?;
+            let zstd_dict = if reader.header().zstd_dict_len > 0 {
+                let mut f = std::fs::File::open(local_osv_path)?;
+                use std::io::{Read, Seek, SeekFrom};
+                let start = reader.header().zstd_dict_offset;
+                let len = usize::try_from(reader.header().zstd_dict_len)
+                    .map_err(|_| CliError::Core(OspreyError::CorruptedFooter))?;
+                f.seek(SeekFrom::Start(start))?;
+                let mut dict = vec![0_u8; len];
+                f.read_exact(&mut dict)?;
+                Some(dict)
+            } else {
+                None
+            };
+            let refine_stage = RefineStage::open_local_path(
+                0,
+                RangePlannerConfig::default(),
+                reader.header(),
+                zstd_dict,
+                local_osv_path,
+            )?;
+            let cache_bytes = args.cache_mb.max(1).saturating_mul(1024 * 1024);
+            let cache = MinipageLruCache::new(cache_bytes);
+            rt.block_on(refine_stage.refine_scored_async(
                 &parsed_query.vector,
                 &stage1_hits,
                 refine_limit,
-                &directory,
+                reader.directory(),
                 &cache,
                 &store,
                 &obj_path,
                 &remote_cfg,
-            )
-            .await
-            .map_err(CliError::from)
-    })?;
+            ))
+            .map_err(CliError::from)?
+        }
+        LocationTarget::Remote(_) => rt.block_on(async {
+            let (directory, zstd_dict) = load_osv_metadata_async(&store, &obj_path).await?;
+            let refine_stage = RefineStage::new(0, RangePlannerConfig::default(), zstd_dict);
+            let cache_bytes = args.cache_mb.max(1).saturating_mul(1024 * 1024);
+            let cache = MinipageLruCache::new(cache_bytes);
+
+            refine_stage
+                .refine_scored_async(
+                    &parsed_query.vector,
+                    &stage1_hits,
+                    refine_limit,
+                    &directory,
+                    &cache,
+                    &store,
+                    &obj_path,
+                    &remote_cfg,
+                )
+                .await
+                .map_err(CliError::from)
+        })?,
+    };
     let stage2_3_ms = t_s23.elapsed().as_secs_f64() * 1_000.0;
 
     // Optional Stage 4: `.osr` ColBERT LUT-Rank reranking over Top-200 survivors
@@ -299,6 +333,10 @@ pub fn execute_search(args: &SearchArgs, ctx: &CliContext) -> CliResult<SearchRe
             coalesce_factor,
             cache_hits: refine_stats.cache_hits,
             bytes_fetched: refine_stats.bytes_fetched,
+            cache_lookup_us: refine_stats.cache_lookup_us,
+            disk_read_us: refine_stats.disk_read_us,
+            zstd_decode_us: refine_stats.zstd_decode_us,
+            f16_score_us: refine_stats.f16_score_us,
             stage2_3_ms,
             rerank_applied: do_rerank,
             rerank_candidates,
@@ -503,6 +541,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
+    use std::fs::File;
     use std::io::BufWriter;
 
     #[test]
@@ -621,6 +660,7 @@ mod tests {
                 batch_size: 16,
                 sample_size: 30,
                 no_zstd_dict: false,
+                osv_compression: crate::cli::OsvCompressionMode::Auto,
                 seed: 77,
             },
             &ctx,

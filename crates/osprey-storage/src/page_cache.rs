@@ -1,17 +1,21 @@
-//! Byte-bounded in-memory LRU cache for hot decompressed `.osv` minipages.
+//! Sharded, byte-bounded in-memory LRU cache for hot decompressed `.osv` minipages.
 //!
-//! Stores `Arc<DecodedMinipage>` entries keyed by `(slab_id: u16, minipage_id: u32)`,
-//! enforces a strict `max_bytes` resident memory cap via $O(1)$ LRU eviction, and
-//! tracks atomic `cache_hits` and `cache_misses` telemetry.
+//! Distributes `(slab_id, minipage_id)` entries across up to 64 cache-line-aligned
+//! shards (`#[repr(align(64))]`) to eliminate global mutex contention under concurrent load,
+//! enforces strict resident memory bounds via $O(1)$ per-shard LRU eviction, and tracks
+//! atomic `cache_hits` and `cache_misses` telemetry.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::osv_slab::DecodedMinipage;
 
 /// Default byte capacity for [`MinipageLruCache`] (`64 MiB`).
 pub const DEFAULT_MINIPAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum shard count for production caches (`>= 4 MiB`), eliminating cross-worker lock contention.
+const MAX_CACHE_SHARDS: usize = 64;
 
 /// Composite cache key `(slab_id, minipage_id)` uniquely identifying a minipage across slabs.
 pub type MinipageCacheKey = (u16, u32);
@@ -34,7 +38,7 @@ pub struct MinipageCacheStats {
 #[derive(Debug)]
 struct CacheNode {
     key: MinipageCacheKey,
-    page: Arc<DecodedMinipage>,
+    page: Option<Arc<DecodedMinipage>>,
     byte_len: usize,
     prev: Option<usize>,
     next: Option<usize>,
@@ -102,33 +106,57 @@ impl LruInner {
         self.push_front(slot);
     }
 
-    fn remove_slot(&mut self, slot: usize) {
+    fn remove_slot(&mut self, slot: usize) -> Option<Arc<DecodedMinipage>> {
         if !self.nodes[slot].occupied {
-            return;
+            return None;
         }
         let key = self.nodes[slot].key;
         let byte_len = self.nodes[slot].byte_len;
+        let evicted = self.nodes[slot].page.take();
         self.unlink(slot);
         self.index.remove(&key);
         self.current_bytes = self.current_bytes.saturating_sub(byte_len);
         self.nodes[slot].occupied = false;
         self.free_slots.push(slot);
+        evicted
     }
 
-    fn evict_lru_tail(&mut self) -> bool {
+    fn evict_lru_tail(&mut self, evicted_out: &mut Vec<Arc<DecodedMinipage>>) -> bool {
         let Some(tail_slot) = self.tail else {
             return false;
         };
-        self.remove_slot(tail_slot);
+        if let Some(page) = self.remove_slot(tail_slot) {
+            evicted_out.push(page);
+        }
         true
     }
 }
 
-/// Thread-safe, byte-bounded LRU cache of decompressed [`DecodedMinipage`] instances.
+#[repr(align(64))]
+#[derive(Debug)]
+struct CacheShard {
+    max_bytes: usize,
+    inner: Mutex<LruInner>,
+    current_bytes: AtomicUsize,
+    entry_count: AtomicUsize,
+}
+
+impl CacheShard {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            inner: Mutex::new(LruInner::new()),
+            current_bytes: AtomicUsize::new(0),
+            entry_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Thread-safe, sharded, byte-bounded LRU cache of decompressed [`DecodedMinipage`] instances.
 #[derive(Debug)]
 pub struct MinipageLruCache {
     max_bytes: usize,
-    inner: Mutex<LruInner>,
+    shards: Box<[CacheShard]>,
     /// Atomic count of cache hits observed by [`MinipageLruCache::get`].
     pub cache_hits: AtomicU64,
     /// Atomic count of cache misses observed by [`MinipageLruCache::get`].
@@ -138,9 +166,21 @@ pub struct MinipageLruCache {
 impl MinipageLruCache {
     /// Creates an empty [`MinipageLruCache`] bounded by `max_bytes`.
     pub fn new(max_bytes: usize) -> Self {
+        let num_shards = if max_bytes >= 4 * 1024 * 1024 {
+            MAX_CACHE_SHARDS
+        } else if max_bytes >= 256 * 1024 {
+            16
+        } else {
+            1
+        };
+        let base_cap = max_bytes / num_shards;
+        let rem = max_bytes % num_shards;
+        let shards: Vec<CacheShard> = (0..num_shards)
+            .map(|idx| CacheShard::new(base_cap + usize::from(idx < rem)))
+            .collect();
         Self {
             max_bytes,
-            inner: Mutex::new(LruInner::new()),
+            shards: shards.into_boxed_slice(),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
         }
@@ -151,6 +191,20 @@ impl MinipageLruCache {
         Self::new(minipage_cache_mb.saturating_mul(1024 * 1024))
     }
 
+    #[inline]
+    fn shard_for(&self, slab_id: u16, minipage_id: u32) -> &CacheShard {
+        if self.shards.len() == 1 {
+            return &self.shards[0];
+        }
+        let mut x = (u64::from(slab_id) << 32) | u64::from(minipage_id);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (x as usize) & (self.shards.len() - 1);
+        &self.shards[idx]
+    }
+
     /// Looks up `(slab_id, minipage_id)`, promoting it to MRU on hit and updating atomic telemetry.
     pub fn get(&self, slab_id: u16, minipage_id: u32) -> Option<Arc<DecodedMinipage>> {
         if self.max_bytes == 0 {
@@ -158,8 +212,9 @@ impl MinipageLruCache {
             return None;
         }
 
+        let shard = self.shard_for(slab_id, minipage_id);
         let key = (slab_id, minipage_id);
-        let mut guard = self
+        let mut guard = shard
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -170,96 +225,148 @@ impl MinipageLruCache {
         };
 
         guard.move_to_front(slot);
-        let page = Arc::clone(&guard.nodes[slot].page);
+        let page = guard.nodes[slot].page.as_ref().map(Arc::clone);
         drop(guard);
 
-        self.cache_hits.fetch_add(1, Ordering::Relaxed);
-        Some(page)
+        if page.is_some() {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        page
     }
 
     /// Inserts or replaces `(slab_id, minipage_id)`, evicting LRU entries until
-    /// `current_bytes + page_bytes <= max_bytes`.
+    /// `current_bytes + page_bytes <= shard.max_bytes`.
     ///
-    /// Entries whose uncompressed byte size exceeds `max_bytes` (or when `max_bytes == 0`)
+    /// Entries whose uncompressed byte size exceeds `shard.max_bytes` (or when `max_bytes == 0`)
     /// are not retained so the memory ceiling is never violated.
     pub fn insert(&self, slab_id: u16, minipage_id: u32, page: Arc<DecodedMinipage>) {
+        if self.max_bytes == 0 {
+            return;
+        }
+
         let page_bytes = page.byte_len();
+        let shard = self.shard_for(slab_id, minipage_id);
         let key = (slab_id, minipage_id);
+        let mut evicted_pages: Vec<Arc<DecodedMinipage>> = Vec::new();
 
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut guard = shard
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if self.max_bytes == 0 || page_bytes > self.max_bytes {
-            if let Some(&existing_slot) = guard.index.get(&key) {
-                guard.remove_slot(existing_slot);
-            }
-            return;
-        }
-
-        if let Some(&existing_slot) = guard.index.get(&key) {
-            let old_bytes = guard.nodes[existing_slot].byte_len;
-            guard.current_bytes = guard.current_bytes.saturating_sub(old_bytes);
-            guard.nodes[existing_slot].page = page;
-            guard.nodes[existing_slot].byte_len = page_bytes;
-            guard.move_to_front(existing_slot);
-
-            while guard.current_bytes + page_bytes > self.max_bytes {
-                if guard.tail == Some(existing_slot) || !guard.evict_lru_tail() {
-                    break;
+            if shard.max_bytes == 0 || page_bytes > shard.max_bytes {
+                if let Some(&existing_slot) = guard.index.get(&key) {
+                    if let Some(old_page) = guard.remove_slot(existing_slot) {
+                        evicted_pages.push(old_page);
+                    }
+                    shard
+                        .current_bytes
+                        .store(guard.current_bytes, Ordering::Relaxed);
+                    shard
+                        .entry_count
+                        .store(guard.index.len(), Ordering::Relaxed);
                 }
+                drop(guard);
+                drop(evicted_pages);
+                return;
             }
-            guard.current_bytes += page_bytes;
-            return;
+
+            if let Some(&existing_slot) = guard.index.get(&key) {
+                let old_bytes = guard.nodes[existing_slot].byte_len;
+                guard.current_bytes = guard.current_bytes.saturating_sub(old_bytes);
+                if let Some(old_page) = guard.nodes[existing_slot].page.replace(page) {
+                    evicted_pages.push(old_page);
+                }
+                guard.nodes[existing_slot].byte_len = page_bytes;
+                guard.move_to_front(existing_slot);
+
+                while guard.current_bytes + page_bytes > shard.max_bytes {
+                    if guard.tail == Some(existing_slot)
+                        || !guard.evict_lru_tail(&mut evicted_pages)
+                    {
+                        break;
+                    }
+                }
+                guard.current_bytes += page_bytes;
+                shard
+                    .current_bytes
+                    .store(guard.current_bytes, Ordering::Relaxed);
+                shard
+                    .entry_count
+                    .store(guard.index.len(), Ordering::Relaxed);
+            } else {
+                while guard.current_bytes + page_bytes > shard.max_bytes {
+                    if !guard.evict_lru_tail(&mut evicted_pages) {
+                        break;
+                    }
+                }
+
+                let slot = if let Some(reused) = guard.free_slots.pop() {
+                    guard.nodes[reused] = CacheNode {
+                        key,
+                        page: Some(page),
+                        byte_len: page_bytes,
+                        prev: None,
+                        next: None,
+                        occupied: true,
+                    };
+                    reused
+                } else {
+                    let idx = guard.nodes.len();
+                    guard.nodes.push(CacheNode {
+                        key,
+                        page: Some(page),
+                        byte_len: page_bytes,
+                        prev: None,
+                        next: None,
+                        occupied: true,
+                    });
+                    idx
+                };
+
+                guard.index.insert(key, slot);
+                guard.push_front(slot);
+                guard.current_bytes += page_bytes;
+                shard
+                    .current_bytes
+                    .store(guard.current_bytes, Ordering::Relaxed);
+                shard
+                    .entry_count
+                    .store(guard.index.len(), Ordering::Relaxed);
+            }
         }
 
-        while guard.current_bytes + page_bytes > self.max_bytes {
-            if !guard.evict_lru_tail() {
-                break;
-            }
-        }
-
-        let slot = if let Some(reused) = guard.free_slots.pop() {
-            guard.nodes[reused] = CacheNode {
-                key,
-                page,
-                byte_len: page_bytes,
-                prev: None,
-                next: None,
-                occupied: true,
-            };
-            reused
-        } else {
-            let idx = guard.nodes.len();
-            guard.nodes.push(CacheNode {
-                key,
-                page,
-                byte_len: page_bytes,
-                prev: None,
-                next: None,
-                occupied: true,
-            });
-            idx
-        };
-
-        guard.index.insert(key, slot);
-        guard.push_front(slot);
-        guard.current_bytes += page_bytes;
+        // Drop evicted pages outside the shard mutex to minimize critical section latency.
+        drop(evicted_pages);
     }
 
     /// Removes all cached entries and resets `current_bytes` to `0`.
     pub fn clear(&self) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.index.clear();
-        guard.nodes.clear();
-        guard.free_slots.clear();
-        guard.head = None;
-        guard.tail = None;
-        guard.current_bytes = 0;
+        for shard in self.shards.iter() {
+            let mut evicted = Vec::new();
+            {
+                let mut guard = shard
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for node in guard.nodes.drain(..) {
+                    if let Some(p) = node.page {
+                        evicted.push(p);
+                    }
+                }
+                guard.index.clear();
+                guard.free_slots.clear();
+                guard.head = None;
+                guard.tail = None;
+                guard.current_bytes = 0;
+                shard.current_bytes.store(0, Ordering::Relaxed);
+                shard.entry_count.store(0, Ordering::Relaxed);
+            }
+            drop(evicted);
+        }
     }
 
     /// Returns the configured byte limit `max_bytes`.
@@ -268,22 +375,26 @@ impl MinipageLruCache {
         self.max_bytes
     }
 
-    /// Returns current resident bytes occupied in the cache.
-    pub fn current_bytes(&self) -> usize {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.current_bytes
+    /// Returns the number of internal cache shards.
+    #[inline]
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 
-    /// Returns the number of cached minipages currently resident.
+    /// Returns current resident bytes occupied in the cache across all shards.
+    pub fn current_bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.current_bytes.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Returns the number of cached minipages currently resident across all shards.
     pub fn len(&self) -> usize {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.index.len()
+        self.shards
+            .iter()
+            .map(|s| s.entry_count.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Returns `true` if no minipages are currently cached.
@@ -305,16 +416,12 @@ impl MinipageLruCache {
 
     /// Returns a point-in-time snapshot of occupancy and hit/miss telemetry.
     pub fn stats(&self) -> MinipageCacheStats {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         MinipageCacheStats {
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
-            current_bytes: guard.current_bytes,
+            current_bytes: self.current_bytes(),
             max_bytes: self.max_bytes,
-            entry_count: guard.index.len(),
+            entry_count: self.len(),
         }
     }
 }
@@ -436,6 +543,36 @@ mod tests {
         assert_eq!(cache.current_bytes(), med.byte_len());
         assert!(cache.get(0, 2).is_some());
         assert!(cache.get(0, 1).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_cache_distributes_across_64_shards_and_enforces_cap() -> OspreyResult<()> {
+        let cache = MinipageLruCache::from_mb(8);
+        assert_eq!(cache.shard_count(), 64);
+        assert_eq!(cache.max_bytes(), 8 * 1024 * 1024);
+
+        let page = make_decoded_minipage(1, 0, 64)?;
+        let mut threads = Vec::new();
+        for t in 0..8_u32 {
+            let page_clone = Arc::clone(&page);
+            let cache_ref = &cache;
+            threads.push((t, page_clone, cache_ref));
+        }
+        std::thread::scope(|s| {
+            for (t, p, c) in threads {
+                s.spawn(move || {
+                    for id in 0..128_u32 {
+                        let page_id = t * 128 + id;
+                        c.insert(0, page_id, Arc::clone(&p));
+                        assert!(c.get(0, page_id).is_some());
+                    }
+                });
+            }
+        });
+        assert!(cache.current_bytes() <= cache.max_bytes());
+        assert_eq!(cache.len(), 1024);
+        assert_eq!(cache.hits(), 1024);
         Ok(())
     }
 }
