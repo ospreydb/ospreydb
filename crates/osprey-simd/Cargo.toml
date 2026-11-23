@@ -1,0 +1,24 @@
+[package]
+name = "osprey-simd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+readme.workspace = true
+description = "Runtime-dispatched SIMD kernels (AVX-512 VPOPCNTDQ/BW, AVX2, ARM64 NEON, scalar fallback) for OspreyDB RaBitQ, FWHT, f16 dot product, and LUT-Rank MaxSim."
+keywords = ["simd", "avx512", "neon", "vector-search", "lut-rank"]
+categories.workspace = true
+
+[dependencies]
+osprey-core.workspace = true
+half.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+roaring.workspace = true
+
+[lints]
+workspace = true

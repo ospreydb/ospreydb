@@ -1,0 +1,47 @@
+services:
+  github-runner:
+    image: myoung34/github-runner:latest
+    container_name: osprey-github-runner
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REPO_URL: ${REPO_URL:-https://github.com/ospreydb/ospreydb}
+      ACCESS_TOKEN: ${ACCESS_TOKEN:-}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      RUNNER_NAME: ${RUNNER_NAME:-osprey-local-builder}
+      RUNNER_WORKDIR: /tmp/runner/work
+      RUNNER_GROUP: ${RUNNER_GROUP:-default}
+      LABELS: ${RUNNER_LABELS:-self-hosted,linux,x64,osprey-builder}
+      EPHEMERAL: "false"
+      DISABLE_AUTO_UPDATE: "false"
+      # Persistent Rust toolchain, Cargo registry, and sccache compilation cache
+      CARGO_HOME: /cargo-cache
+      RUSTUP_HOME: /cargo-cache/rustup
+      SCCACHE_DIR: /sccache
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    volumes:
+      # Docker-out-of-Docker for Buildx multi-arch Distroless image builds
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent Cargo registry, git checkouts, rustup toolchains, and CI tools
+      - cargo-cache:/cargo-cache
+      # Persistent sccache artifact cache across branches, PRs, and tags
+      - sccache-cache:/sccache
+      # Persistent runner workdir so Cargo `target/` survives between jobs
+      - runner-work:/tmp/runner/work
+    group_add:
+      - "${DOCKER_GID:-999}"
+    security_opt:
+      # Required on Fedora/RHEL SELinux hosts to access docker.sock without relabeling it
+      - label=disable
+
+volumes:
+  cargo-cache:
+    name: osprey-cargo-cache
+  sccache-cache:
+    name: osprey-sccache
+  runner-work:
+    name: osprey-runner-work

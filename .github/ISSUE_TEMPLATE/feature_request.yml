@@ -1,0 +1,26 @@
+name: Feature Request
+description: Propose a kernel optimization, storage format improvement, server endpoint, or CLI flag for OspreyDB
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This tracker covers OspreyDB (`osprey-core`, `osprey-simd`, `osprey-storage`, `osprey-cli`, `ospreydb`).
+        For usage questions or deployment help, please start a thread in [GitHub Discussions](https://github.com/ospreydb/ospreydb/discussions).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Bottleneck
+      description: Describe the workload, dataset scale, or missing capability you ran into.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed CLI, Server, or Crate Change
+      description: Specify the proposed flags, HTTP/Flight APIs, file-format impact, or crate API changes.
+    validations:
+      required: true

@@ -1,0 +1,37 @@
+[package]
+name = "osprey-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+osprey-core = { path = "../crates/osprey-core" }
+osprey-storage = { path = "../crates/osprey-storage" }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[[bin]]
+name = "fuzz_osi_parser"
+path = "fuzz_targets/fuzz_osi_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_osv_parser"
+path = "fuzz_targets/fuzz_osv_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_osr_parser"
+path = "fuzz_targets/fuzz_osr_parser.rs"
+test = false
+doc = false
+bench = false

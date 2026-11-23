@@ -1,0 +1,313 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.2) for dry-run validation'
+        required: false
+        default: 'v0.1.2'
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Resolve & Validate Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+
+      - name: Resolve release tag & verify Cargo.toml version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          VERSION="${TAG#v}"
+          PKG_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; pkgs=json.load(sys.stdin)['packages']; print(next(p['version'] for p in pkgs if p['name']=='ospreydb'))")"
+          if [ "${VERSION}" != "${PKG_VERSION}" ]; then
+            echo "::warning::Tag version (${VERSION}) differs from Cargo.toml (${PKG_VERSION})"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build-release:
+    name: Build Release Binary (${{ matrix.target }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - os: macos-15
+            target: x86_64-apple-darwin
+            use_cross: false
+          - os: macos-15
+            target: aarch64-apple-darwin
+            use_cross: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for Linux aarch64)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache Rust dependencies
+        if: "!matrix.use_cross"
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build osprey binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --locked --target "${{ matrix.target }}" -p ospreydb --bin osprey
+          else
+            rustup target add "${{ matrix.target }}"
+            cargo build --release --locked --target "${{ matrix.target }}" -p ospreydb --bin osprey
+          fi
+
+      - name: Package archive & SHA-256 checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.plan.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE_DIR="osprey-${VERSION}-${TARGET}"
+          mkdir -p "dist/${ARCHIVE_DIR}"
+          cp "target/${TARGET}/release/osprey" "dist/${ARCHIVE_DIR}/osprey"
+          cp LICENSE NOTICE README.md "dist/${ARCHIVE_DIR}/"
+          chmod 0755 "dist/${ARCHIVE_DIR}/osprey"
+          tar -C dist -czf "dist/${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ARCHIVE_DIR}.tar.gz" > "${ARCHIVE_DIR}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${ARCHIVE_DIR}.tar.gz" > "${ARCHIVE_DIR}.tar.gz.sha256")
+          fi
+          rm -rf "dist/${ARCHIVE_DIR}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+
+  publish-release:
+    name: Publish GitHub Release & SHA256SUMS
+    needs: [plan, build-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Consolidate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release (ospreydb/ospreydb)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.tag }}
+          name: OspreyDB ${{ needs.plan.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+            artifacts/SHA256SUMS.txt
+
+  docker:
+    name: Build & Push Distroless Multi-Arch Image (GHCR)
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/ospreydb/osprey
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push multi-arch Distroless image (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  update-homebrew-tap:
+    name: Update ospreydb/homebrew-tap Formula
+    needs: [plan, publish-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check HOMEBREW_TAP_TOKEN availability
+        id: check_token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          if [ -n "${HOMEBREW_TAP_TOKEN}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN not set; skipping automatic Homebrew tap update."
+          fi
+
+      - name: Download release artifacts for SHA-256 calculation
+        if: steps.check_token.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Checkout ospreydb/homebrew-tap
+        if: steps.check_token.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ospreydb/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Regenerate Formula/osprey.rb and push
+        if: steps.check_token.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.plan.outputs.tag }}"
+          VERSION="${{ needs.plan.outputs.version }}"
+          SHA_MAC_ARM="$(awk '{print $1}' "artifacts/osprey-${VERSION}-aarch64-apple-darwin.tar.gz.sha256")"
+          SHA_MAC_X64="$(awk '{print $1}' "artifacts/osprey-${VERSION}-x86_64-apple-darwin.tar.gz.sha256")"
+          SHA_LIN_ARM="$(awk '{print $1}' "artifacts/osprey-${VERSION}-aarch64-unknown-linux-gnu.tar.gz.sha256")"
+          SHA_LIN_X64="$(awk '{print $1}' "artifacts/osprey-${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256")"
+
+          python3 - <<PY
+          import textwrap
+          formula = f'''class Osprey < Formula
+            desc "100% Apache-2.0 Vector Database Server & CLI (1-Bit RaBitQ, Zstd S3 Slabs, CPU LUT-Rank)"
+            homepage "https://ospreydb.ramoslucas-lr.workers.dev"
+            version "{VERSION}"
+            license "Apache-2.0"
+
+            head do
+              url "https://github.com/ospreydb/ospreydb.git", branch: "main"
+              depends_on "rust" => :build
+            end
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/ospreydb/ospreydb/releases/download/{TAG}/osprey-{VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "{SHA_MAC_ARM}"
+              else
+                url "https://github.com/ospreydb/ospreydb/releases/download/{TAG}/osprey-{VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "{SHA_MAC_X64}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/ospreydb/ospreydb/releases/download/{TAG}/osprey-{VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "{SHA_LIN_ARM}"
+              else
+                url "https://github.com/ospreydb/ospreydb/releases/download/{TAG}/osprey-{VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "{SHA_LIN_X64}"
+              end
+            end
+
+            def install
+              if build.head?
+                system "cargo", "install", *std_cargo_args(path: "crates/ospreydb")
+              else
+                bin.install "osprey"
+              end
+            end
+
+            test do
+              assert_match "osprey", shell_output("#{{bin}}/osprey --version")
+              system "#{{bin}}/osprey", "doctor"
+            end
+          end
+          '''
+          with open("homebrew-tap/Formula/osprey.rb", "w", encoding="utf-8") as f:
+              f.write(textwrap.dedent(formula))
+          PY
+
+          cd homebrew-tap
+          git config user.name "ospreydb-release-bot"
+          git config user.email "release@ospreydb.dev"
+          git add Formula/osprey.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(formula): update osprey to ${TAG}"
+            git push
+          fi

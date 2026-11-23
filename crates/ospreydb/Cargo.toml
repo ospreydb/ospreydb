@@ -1,0 +1,57 @@
+[package]
+name = "ospreydb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+readme.workspace = true
+categories.workspace = true
+publish = false
+description = "OspreyDB Vector Database: 1-bit RaBitQ RAM index, Zstd S3 slabs, CPU LUT-Rank reranker, WAL/LSM delta ingestion, CoW compaction, Arrow Flight & Qdrant/Cohere HTTP API"
+
+[[bin]]
+name = "osprey"
+path = "src/main.rs"
+
+[dependencies]
+osprey-core.workspace = true
+osprey-simd.workspace = true
+osprey-storage.workspace = true
+osprey-cli.workspace = true
+
+arrow.workspace = true
+arrow-flight.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytemuck.workspace = true
+bytes.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+crc32fast.workspace = true
+futures.workspace = true
+half.workspace = true
+object_store.workspace = true
+prost.workspace = true
+rayon.workspace = true
+reqwest.workspace = true
+roaring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+yansi.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

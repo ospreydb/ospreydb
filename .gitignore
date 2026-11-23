@@ -1,0 +1,70 @@
+# Rust build artifacts & Cargo
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Memory dumps, crash reports & profiling artifacts
+*.dmp
+*.mdmp
+*.hdmp
+core
+core.*
+*.core
+*.heap
+*.hprof
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+*.flamegraph
+vgcore.*
+callgrind.out.*
+massif.out.*
+heaptrack.*
+
+# Local Parquet datasets & columnar data artifacts
+*.parquet
+*.pq
+
+# OspreyDB binary storage formats & raw binary dumps
+*.osi
+*.osv
+*.osr
+*.bin
+!reference/golden/
+!reference/golden/**
+
+# Cryptographic keys, certificates & secrets
+*.pem
+*.key
+*.sk
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+infra/ci/.env
+
+# Self-hosted CI/CD runner & build caches
+infra/ci/.cache/
+cargo-cache/
+sccache/
+.sccache/
+dist/
+dist-docker/
+
+# OS & editor junk
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
